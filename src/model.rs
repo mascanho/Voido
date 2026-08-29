@@ -180,6 +180,22 @@ impl Project {
             .filter(|m| !m.done)
             .min_by_key(|m| m.date)
     }
+
+    /// (done, total) subtask counts across all todos.
+    pub fn subtask_progress(&self) -> (usize, usize) {
+        let total = self.todos.iter().map(|t| t.subtasks.len()).sum();
+        let done = self
+            .todos
+            .iter()
+            .flat_map(|t| &t.subtasks)
+            .filter(|s| s.done)
+            .count();
+        (done, total)
+    }
+
+    pub fn note_count(&self) -> usize {
+        self.notes.len()
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

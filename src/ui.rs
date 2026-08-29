@@ -17,6 +17,7 @@ use crate::app::{
 use crate::model::Priority;
 use crate::theme::{accent, bg, blue, border, green, on_accent, red, sel_bg, subtle, text, yellow};
 use crate::util::truncate;
+use unicode_width::UnicodeWidthChar;
 
 pub fn render(f: &mut Frame, app: &App) {
     let area = f.area();
@@ -134,45 +135,138 @@ fn render_projects(f: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    let items: Vec<ListItem> = app
+    let pane_w = area.width as usize;
+    let icon_w = 2;
+    let dw = |s: &str| s.chars().map(|c| c.width().unwrap_or(1)).sum::<usize>();
+    let center = |val: &str, w: usize| {
+        let vd = dw(val);
+        if vd >= w {
+            val.chars().take(w.saturating_sub(1)).collect::<String>() + "…"
+        } else {
+            let l = (w - vd) / 2;
+            let r = w - vd - l;
+            format!("{}{}{}", " ".repeat(l), val, " ".repeat(r))
+        }
+    };
+
+    struct Row<'a> {
+        dot: Span<'a>,
+        name: String,
+        name_style: Style,
+        tasks: String,
+        tasks_style: Style,
+        subs: String,
+        subs_style: Style,
+        notes: String,
+        notes_style: Style,
+    }
+
+    let raw: Vec<Row<'_>> = app
         .store
         .projects
         .iter()
         .map(|p| {
             let open = p.open_todos();
-            let (dot, name_style, tail) = if p.is_complete() {
+            let total = p.todos.len();
+            let (dot, name_style) = if p.is_complete() {
                 (
                     Span::styled("✔ ", Style::new().fg(green())),
                     Style::new()
                         .fg(subtle())
                         .add_modifier(Modifier::CROSSED_OUT),
-                    Span::raw(""),
                 )
             } else if open == 0 {
-                let tail = if p.todos.is_empty() {
-                    Span::raw("")
-                } else {
-                    Span::styled("  clear", Style::new().fg(subtle()))
-                };
                 (
                     Span::styled("● ", Style::new().fg(green())),
                     Style::new().fg(text()),
-                    tail,
                 )
             } else {
                 (
                     Span::styled("● ", Style::new().fg(accent())),
                     Style::new().fg(text()),
-                    Span::styled(format!("  {open}"), Style::new().fg(subtle())),
                 )
             };
-            ListItem::new(Line::from(vec![
-                dot,
-                Span::styled(p.name.clone(), name_style),
-                tail,
-            ]))
+
+            let (tasks, tasks_s) = if total > 0 {
+                let d = p.done_todos();
+                let s = format!("{d}/{total}");
+                let c = if d == total {
+                    Style::new().fg(green())
+                } else {
+                    Style::new().fg(subtle())
+                };
+                (s, c)
+            } else {
+                ("-".into(), Style::new().fg(subtle()))
+            };
+
+            let (sd, st) = p.subtask_progress();
+            let (subs, subs_s) = if st > 0 {
+                let s = format!("{sd}/{st}");
+                let c = if sd == st {
+                    Style::new().fg(green())
+                } else {
+                    Style::new().fg(subtle())
+                };
+                (s, c)
+            } else {
+                ("-".into(), Style::new().fg(subtle()))
+            };
+
+            let nc = p.note_count();
+            let notes = if nc > 0 {
+                format!("{nc}")
+            } else {
+                "-".into()
+            };
+
+            Row { dot, name: p.name.clone(), name_style, tasks, tasks_style: tasks_s, subs, subs_style: subs_s, notes, notes_style: Style::new().fg(subtle()) }
         })
         .collect();
+
+    let max_name = raw.iter().map(|r| r.name.chars().count()).max().unwrap_or(0);
+
+    let pw = (pane_w as f64 * 0.05) as usize;
+    let tasks_w = (raw.iter().map(|r| dw(&r.tasks)).max().unwrap_or(5).max(5) + pw).max(6);
+    let subs_w = (raw.iter().map(|r| dw(&r.subs)).max().unwrap_or(5).max(5) + pw).max(6);
+    let notes_w = (raw.iter().map(|r| dw(&r.notes)).max().unwrap_or(3).max(3) + pw).max(4);
+    let meta_total = 2 + tasks_w + 2 + subs_w + 2 + notes_w;
+    let name_w = pane_w.saturating_sub(icon_w + 1 + meta_total).max(max_name);
+
+    let header = ListItem::new(Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            " ".repeat(name_w),
+            Style::new().fg(subtle()).bold(),
+        ),
+        Span::styled(" │ ", Style::new().fg(border())),
+        Span::styled(center("󰆼", tasks_w), Style::new().fg(subtle()).bold()),
+        Span::styled(" │ ", Style::new().fg(border())),
+        Span::styled(center("󰆸", subs_w), Style::new().fg(subtle()).bold()),
+        Span::styled(" │ ", Style::new().fg(border())),
+        Span::styled(center("󰈙", notes_w), Style::new().fg(subtle()).bold()),
+    ]));
+
+    let mut items = vec![header];
+    items.extend(raw.into_iter().map(|r| {
+        let nc = r.name.chars().count();
+        let pad = if nc < name_w {
+            " ".repeat(name_w - nc)
+        } else {
+            String::new()
+        };
+        ListItem::new(Line::from(vec![
+            r.dot,
+            Span::styled(r.name, r.name_style),
+            Span::raw(pad),
+            Span::styled(" │ ", Style::new().fg(border())),
+            Span::styled(center(&r.tasks, tasks_w), r.tasks_style),
+            Span::styled(" │ ", Style::new().fg(border())),
+            Span::styled(center(&r.subs, subs_w), r.subs_style),
+            Span::styled(" │ ", Style::new().fg(border())),
+            Span::styled(center(&r.notes, notes_w), r.notes_style),
+        ]))
+    }));
 
     let list = List::new(items)
         .block(block)
@@ -183,7 +277,7 @@ fn render_projects(f: &mut Frame, area: Rect, app: &App) {
         })
         .highlight_symbol(if focused { "▍" } else { " " });
     let mut state = ListState::default();
-    state.select(Some(app.project_idx));
+    state.select(Some(app.project_idx + 1));
     f.render_stateful_widget(list, area, &mut state);
 }
 

@@ -35,20 +35,31 @@ pub fn render(f: &mut Frame, app: &App) {
     render_header(f, rows[0], app);
 
     if app.tab == Tab::Todos || app.tab == Tab::Notes {
-        let body = Layout::horizontal([
-            Constraint::Length(42),
-            Constraint::Min(22),
-            Constraint::Percentage(48),
-        ])
-        .split(rows[1]);
-        render_projects(f, body[0], app);
-        render_content(f, body[1], app);
-        if app.tab == Tab::Todos {
-            render_subtasks(f, body[2], app);
-        } else if let Mode::EditBody(state) = &app.mode {
-            render_edit_body_pane(f, body[2], state, app);
+        if app.tab == Tab::Notes && app.note_expanded && app.focus == Focus::Detail {
+            // Full-width note mode — projects + note body only
+            let body = Layout::horizontal([
+                Constraint::Length(42),
+                Constraint::Min(0),
+            ])
+            .split(rows[1]);
+            render_projects(f, body[0], app);
+            render_note_body(f, body[1], app);
         } else {
-            render_note_body(f, body[2], app);
+            let body = Layout::horizontal([
+                Constraint::Length(42),
+                Constraint::Min(22),
+                Constraint::Percentage(48),
+            ])
+            .split(rows[1]);
+            render_projects(f, body[0], app);
+            render_content(f, body[1], app);
+            if app.tab == Tab::Todos {
+                render_subtasks(f, body[2], app);
+            } else if let Mode::EditBody(state) = &app.mode {
+                render_edit_body_pane(f, body[2], state, app);
+            } else {
+                render_note_body(f, body[2], app);
+            }
         }
     } else {
         let body =
@@ -63,6 +74,7 @@ pub fn render(f: &mut Frame, app: &App) {
         Mode::Input(input) => render_input(f, area, input),
         Mode::Confirm(c) => render_confirm(f, area, c),
         Mode::Help => render_help(f, area),
+        Mode::GitHub => render_github(f, area, app),
         Mode::EditBody(_) => {}
         Mode::Normal => {}
     }
@@ -125,7 +137,7 @@ fn render_projects(f: &mut Frame, area: Rect, app: &App) {
         .highlight_style(if focused {
             Style::new().bg(SEL_BG).fg(ACCENT).bold()
         } else {
-            Style::new()
+            Style::new().bg(SEL_BG)
         })
         .highlight_symbol(if focused { "▍ " } else { "  " });
     let mut state = ListState::default();
@@ -281,9 +293,9 @@ fn render_notes(f: &mut Frame, area: Rect, app: &App) {
     let list = List::new(items)
         .block(block)
         .highlight_style(if focused {
-            Style::new().bg(SEL_BG).bold()
+            Style::new().bg(SEL_BG).fg(ACCENT).bold()
         } else {
-            Style::new()
+            Style::new().bg(SEL_BG)
         })
         .highlight_symbol(if focused { "▍ " } else { "  " });
     let mut state = ListState::default();
@@ -355,7 +367,7 @@ fn render_todos(f: &mut Frame, area: Rect, app: &App) {
         .highlight_style(if focused {
             Style::new().bg(SEL_BG).bold()
         } else {
-            Style::new()
+            Style::new().bg(SEL_BG)
         })
         .highlight_symbol(if focused { "▍ " } else { "  " });
     let mut state = ListState::default();
@@ -418,7 +430,7 @@ fn render_subtasks(f: &mut Frame, area: Rect, app: &App) {
         .highlight_style(if focused {
             Style::new().bg(SEL_BG).bold()
         } else {
-            Style::new()
+            Style::new().bg(SEL_BG)
         })
         .highlight_symbol(if focused { "▍ " } else { "  " });
     let mut state = ListState::default();
@@ -592,7 +604,7 @@ fn render_timeline(f: &mut Frame, area: Rect, app: &App) {
         .highlight_style(if focused {
             Style::new().bg(SEL_BG).bold()
         } else {
-            Style::new()
+            Style::new().bg(SEL_BG)
         })
         .highlight_symbol(if focused { "▍ " } else { "  " });
     let mut state = ListState::default();
@@ -605,30 +617,26 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
         Mode::Input(_) => "enter  confirm      esc  cancel",
         Mode::Confirm(_) => "y  yes      n  cancel",
         Mode::EditBody(_) => "esc / ^s  save & close",
-        Mode::Help => "any key  close",
-        Mode::Normal => match app.focus {
-            Focus::Projects => {
-                "j/k move   a add   r rename   d delete   l open   tab panel   ? help   q quit"
-            }
-            Focus::Content => match app.tab {
-                Tab::Overview => "e edit description   r rename project   o/t/n/d switch tab   h back",
-                Tab::Todos => {
-                    "j/k move   a add   e edit   x done   p priority   J/K reorder   l subtasks   d delete   t tab"
-                }
-                Tab::Notes => {
-                    "j/k move   a add   e edit   x pin   J/K reorder   l open   d delete   t tab"
-                }
-                Tab::Schedule => {
-                    "j/k move   a add   x done   r reschedule   Enter jump   d delete   0/1/2/3 filter"
-                }
-            },
-            Focus::Detail => match app.tab {
-                Tab::Notes => "j/k scroll   ^d/^u page   e edit markdown   h back",
-                _ => "j/k move   a add   e edit   x done   J/K reorder   d delete   h back to todo",
-            },
-        },
+        Mode::Help | Mode::GitHub => "any key  close",
+        Mode::Normal => "? help   q quit",
     };
-    let line = Line::from(vec![
+
+    // Pane indicator — only show the active one
+    let pane_label = match app.focus {
+        Focus::Projects => "P1",
+        Focus::Content => "P2",
+        Focus::Detail => "P3",
+    };
+    let pane_style = match &app.mode {
+        Mode::Input(_) | Mode::EditBody(_) => Style::new().fg(Color::Black).bg(YELLOW).bold(),
+        _ => Style::new().fg(Color::Black).bg(ACCENT).bold(),
+    };
+
+    // Build breadcrumbs
+    let breadcrumb = build_breadcrumb(app);
+
+    let left = Line::from(vec![
+        Span::styled(format!(" {pane_label} "), pane_style),
         Span::styled(
             format!(" {} ", app.status),
             Style::new().fg(Color::Black).bg(ACCENT).bold(),
@@ -636,7 +644,67 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
         Span::raw("  "),
         Span::styled(keys, Style::new().fg(SUBTLE)),
     ]);
-    f.render_widget(Paragraph::new(line), area);
+
+    let right = Line::from(Span::styled(&breadcrumb, Style::new().fg(ACCENT)));
+
+    let cols = Layout::horizontal([Constraint::Min(0), Constraint::Length(0)]).split(area);
+    f.render_widget(Paragraph::new(left), cols[0]);
+
+    // Right-align breadcrumbs
+    let bc_width = breadcrumb.chars().count() as u16;
+    if area.width > bc_width + 1 {
+        let r = Rect {
+            x: area.x + area.width - bc_width,
+            y: area.y,
+            width: bc_width,
+            height: 1,
+        };
+        f.render_widget(Paragraph::new(right), r);
+    }
+}
+
+fn build_breadcrumb(app: &App) -> String {
+    let mut parts: Vec<String> = Vec::new();
+
+    // Project name
+    if let Some(p) = app.current_project() {
+        parts.push(p.name.clone());
+    } else {
+        return String::new();
+    }
+
+    match app.focus {
+        Focus::Projects => {
+            parts.push("projects".into());
+        }
+        Focus::Content => {
+            match app.tab {
+                Tab::Overview => parts.push("overview".into()),
+                Tab::Todos => parts.push("todos".into()),
+                Tab::Notes => parts.push("notes".into()),
+                Tab::Schedule => parts.push("schedule".into()),
+            }
+        }
+        Focus::Detail => {
+            match app.tab {
+                Tab::Todos => {
+                    parts.push("todos".into());
+                    if let Some(t) = app.current_todo() {
+                        parts.push(truncate(&t.title, 20));
+                    }
+                }
+                Tab::Notes => {
+                    parts.push("notes".into());
+                    if let Some(n) = app.current_note() {
+                        parts.push(truncate(&n.text, 20));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    parts.join(" > ")
 }
 
 // ---- overlays -------------------------------------------------------
@@ -709,6 +777,8 @@ fn render_help(f: &mut Frame, area: Rect) {
         "  Projects",
         "    j k              move selection",
         "    a / r / d        add / rename / delete",
+        "    ^g               link GitHub repo (owner/repo)",
+        "    h / left         show GitHub activity",
         "    l / enter        open project",
         "",
         "  Todos",
@@ -776,6 +846,113 @@ fn render_help(f: &mut Frame, area: Rect) {
         })
         .collect();
     f.render_widget(Paragraph::new(lines).block(block), rect);
+}
+
+fn render_github(f: &mut Frame, area: Rect, app: &App) {
+    let Some(info) = &app.gh_cache else {
+        let rect = popup(area, 50, 5);
+        f.render_widget(Clear, rect);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::new().fg(ACCENT))
+            .title(Span::styled(" GitHub ", Style::new().fg(ACCENT).bold()))
+            .padding(Padding::horizontal(2));
+        f.render_widget(
+            Paragraph::new("No data loaded."). block(block),
+            rect,
+        );
+        return;
+    };
+
+    let width = area.width.saturating_sub(8).clamp(40, 80);
+    let height = area.height.saturating_sub(4).min(30);
+    let rect = popup(area, width, height);
+    f.render_widget(Clear, rect);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(ACCENT))
+        .title(Span::styled(
+            " GitHub ",
+            Style::new().fg(ACCENT).bold(),
+        ))
+        .padding(Padding::horizontal(1));
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Commits
+    lines.push(Line::from(Span::styled(
+        "  Commits",
+        Style::new().fg(ACCENT).bold(),
+    )));
+    if info.commits.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "    no recent commits",
+            Style::new().fg(SUBTLE),
+        )));
+    } else {
+        for c in info.commits.iter().take(5) {
+            let sha = &c.sha[..7.min(c.sha.len())];
+            let msg = c.commit.message.lines().next().unwrap_or("");
+            let msg = if msg.chars().count() > 40 {
+                let kept: String = msg.chars().take(39).collect();
+                format!("{kept}…")
+            } else {
+                msg.to_string()
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("    {sha} "), Style::new().fg(BLUE)),
+                Span::styled(msg, Style::new().fg(Color::White)),
+            ]));
+        }
+    }
+    lines.push(Line::from(""));
+
+    // Pull Requests
+    lines.push(Line::from(Span::styled(
+        "  Open PRs",
+        Style::new().fg(ACCENT).bold(),
+    )));
+    let prs: Vec<_> = info.prs.iter().filter(|p| p.state == "open").collect();
+    if prs.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "    no open PRs",
+            Style::new().fg(SUBTLE),
+        )));
+    } else {
+        for pr in prs.iter().take(5) {
+            lines.push(Line::from(vec![
+                Span::styled(format!("    #{} ", pr.number), Style::new().fg(BLUE)),
+                Span::styled(pr.title.clone(), Style::new().fg(Color::White)),
+            ]));
+        }
+    }
+    lines.push(Line::from(""));
+
+    // Issues
+    lines.push(Line::from(Span::styled(
+        "  Open Issues",
+        Style::new().fg(ACCENT).bold(),
+    )));
+    let issues: Vec<_> = info.issues.iter().filter(|i| i.state == "open").collect();
+    if issues.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "    no open issues",
+            Style::new().fg(SUBTLE),
+        )));
+    } else {
+        for issue in issues.iter().take(5) {
+            lines.push(Line::from(vec![
+                Span::styled(format!("    #{} ", issue.number), Style::new().fg(BLUE)),
+                Span::styled(issue.title.clone(), Style::new().fg(Color::White)),
+            ]));
+        }
+    }
+
+    let para = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+    f.render_widget(para, rect);
 }
 
 // ---- helpers -------------------------------------------------------

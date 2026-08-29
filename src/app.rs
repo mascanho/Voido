@@ -4,6 +4,7 @@ use chrono::{Local, NaiveDate};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tui_textarea::TextArea;
 
+use crate::github::{GitHubClient, RepoInfo};
 use crate::model::{Milestone, Note, Priority, Project, Store, Subtask, Todo};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,6 +81,7 @@ pub enum InputAction {
     EditMilestone(usize),
     RescheduleTodo(usize),
     RescheduleMilestone(usize),
+    LinkRepo,
 }
 
 pub struct InputState {
@@ -114,6 +116,7 @@ pub enum Mode {
     Confirm(ConfirmState),
     EditBody(Box<EditState>),
     Help,
+    GitHub,
 }
 
 pub struct App {
@@ -125,6 +128,7 @@ pub struct App {
     pub subtask_idx: usize,
     pub note_idx: usize,
     pub note_scroll: u16,
+    pub note_expanded: bool,
     pub timeline_idx: usize,
     pub deadline_filter: DeadlineFilter,
     pub mode: Mode,
@@ -132,6 +136,9 @@ pub struct App {
     pub should_quit: bool,
     pub dirty: bool,
     pending_g: bool,
+    pub gh_client: GitHubClient,
+    pub gh_cache: Option<RepoInfo>,
+    pub gh_loading: bool,
 }
 
 impl App {
@@ -145,13 +152,17 @@ impl App {
             subtask_idx: 0,
             note_idx: 0,
             note_scroll: 0,
+            note_expanded: false,
             timeline_idx: 0,
             deadline_filter: DeadlineFilter::All,
             mode: Mode::Normal,
-            status: "welcome — press ? for help".into(),
+            status: String::new(),
             should_quit: false,
             dirty: false,
             pending_g: false,
+            gh_client: GitHubClient::new(None),
+            gh_cache: None,
+            gh_loading: false,
         }
     }
 
@@ -334,14 +345,23 @@ impl App {
             Mode::Input(_) => self.handle_input(key),
             Mode::Confirm(_) => self.handle_confirm(key),
             Mode::EditBody(_) => self.handle_edit_body(key),
-            Mode::Help => self.mode = Mode::Normal,
+            Mode::Help | Mode::GitHub => self.mode = Mode::Normal,
         }
     }
 
     fn handle_normal(&mut self, key: KeyEvent) {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
-            if let KeyCode::Char('c') = key.code {
-                self.should_quit = true;
+            match key.code {
+                KeyCode::Char('c') => self.should_quit = true,
+                KeyCode::Char('g') => {
+                    if self.focus == Focus::Projects {
+                        if let Some(p) = self.current_project() {
+                            let pre = p.repo.clone().unwrap_or_default();
+                            self.begin_input("Link GitHub repo (owner/repo)", pre, InputAction::LinkRepo);
+                        }
+                    }
+                }
+                _ => {}
             }
             return;
         }
@@ -421,6 +441,19 @@ impl App {
                         prompt,
                         action: ConfirmAction::DeleteProject(i),
                     });
+                }
+            }
+            KeyCode::Char('h') | KeyCode::Left => {
+                if let Some(p) = self.current_project() {
+                    if let Some(ref repo) = p.repo {
+                        let repo = repo.clone();
+                        let parts: Vec<&str> = repo.split('/').collect();
+                        if parts.len() == 2 {
+                            self.fetch_github(parts[0], parts[1]);
+                        }
+                    } else {
+                        self.status = "no repo linked — press g to link".into();
+                    }
                 }
             }
             KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => {
@@ -686,8 +719,26 @@ impl App {
             }
             KeyCode::PageDown => self.note_scroll = self.note_scroll.saturating_add(10),
             KeyCode::PageUp => self.note_scroll = self.note_scroll.saturating_sub(10),
-            KeyCode::Char('h') | KeyCode::Left => self.focus = Focus::Content,
-            KeyCode::Char('e') | KeyCode::Char('i') | KeyCode::Enter => self.begin_edit_body(),
+            KeyCode::Char('h') | KeyCode::Left => {
+                if self.note_expanded {
+                    self.note_expanded = false;
+                } else {
+                    self.focus = Focus::Content;
+                }
+            }
+            KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => {
+                if self.note_expanded {
+                    self.note_expanded = false;
+                } else {
+                    self.note_expanded = true;
+                }
+            }
+            KeyCode::Char('e') | KeyCode::Char('i') => self.begin_edit_body(),
+            KeyCode::Esc => {
+                if self.note_expanded {
+                    self.note_expanded = false;
+                }
+            }
             _ => {}
         }
     }
@@ -1082,6 +1133,26 @@ impl App {
                     }
                 }
             }
+            InputAction::LinkRepo => {
+                let value = input.value.trim().to_string();
+                if value.is_empty() {
+                    if let Some(p) = self.current_project_mut() {
+                        p.repo = None;
+                        self.dirty = true;
+                        self.gh_cache = None;
+                        self.status = "repo unlinked".into();
+                    }
+                } else if let Some((owner, repo)) = crate::github::parse_repo_string(&value) {
+                    if let Some(p) = self.current_project_mut() {
+                        p.repo = Some(format!("{owner}/{repo}"));
+                        self.dirty = true;
+                        self.status = format!("linked to {owner}/{repo}").into();
+                        self.fetch_github(&owner, &repo);
+                    }
+                } else {
+                    self.status = "invalid repo format — use owner/repo".into();
+                }
+            }
         }
     }
 
@@ -1191,6 +1262,23 @@ impl App {
         self.tab = tab;
         if self.focus == Focus::Detail && !self.detail_available() {
             self.focus = Focus::Content;
+        }
+    }
+
+    fn fetch_github(&mut self, owner: &str, repo: &str) {
+        self.gh_loading = true;
+        self.status = format!("fetching {owner}/{repo}...").into();
+        match self.gh_client.fetch_repo_info(owner, repo) {
+            Ok(info) => {
+                self.gh_cache = Some(info);
+                self.gh_loading = false;
+                self.mode = Mode::GitHub;
+                self.status = "github data loaded".into();
+            }
+            Err(e) => {
+                self.gh_loading = false;
+                self.status = format!("github error: {e}").into();
+            }
         }
     }
 

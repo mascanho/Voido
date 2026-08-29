@@ -117,6 +117,8 @@ pub struct Project {
     #[serde(default)]
     pub description: String,
     #[serde(default)]
+    pub repo: Option<String>,
+    #[serde(default)]
     pub todos: Vec<Todo>,
     #[serde(default)]
     pub notes: Vec<Note>,
@@ -129,6 +131,7 @@ impl Project {
         Self {
             name: name.into(),
             description: String::new(),
+            repo: None,
             todos: Vec::new(),
             notes: Vec::new(),
             milestones: Vec::new(),

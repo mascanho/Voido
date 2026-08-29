@@ -139,6 +139,12 @@ pub struct Project {
     pub notes: Vec<Note>,
     #[serde(default)]
     pub milestones: Vec<Milestone>,
+    #[serde(default = "default_date")]
+    pub created: NaiveDate,
+}
+
+fn default_date() -> NaiveDate {
+    NaiveDate::from_ymd_opt(2026, 1, 1).unwrap()
 }
 
 impl Project {
@@ -150,6 +156,7 @@ impl Project {
             todos: Vec::new(),
             notes: Vec::new(),
             milestones: Vec::new(),
+            created: chrono::Local::now().date_naive(),
         }
     }
 

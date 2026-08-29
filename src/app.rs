@@ -191,6 +191,7 @@ pub struct App {
     pub note_idx: usize,
     pub note_scroll: u16,
     pub note_expanded: bool,
+    pub project_info: bool,
     pub timeline_idx: usize,
     pub deadline_filter: DeadlineFilter,
     pub mode: Mode,
@@ -254,6 +255,7 @@ impl App {
             note_idx: 0,
             note_scroll: 0,
             note_expanded: false,
+            project_info: false,
             timeline_idx: 0,
             deadline_filter: DeadlineFilter::All,
             mode: Mode::Normal,
@@ -836,6 +838,9 @@ impl App {
                 }
             }
             KeyCode::Char('o') => self.show_github(),
+            KeyCode::Char('i') => {
+                self.project_info = !self.project_info;
+            }
             KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => {
                 if !self.store.projects.is_empty() {
                     self.focus = Focus::Content;

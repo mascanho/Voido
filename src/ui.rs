@@ -248,14 +248,14 @@ fn render_projects(f: &mut Frame, area: Rect, app: &App) {
     ]));
 
     let mut items = vec![header];
-    items.extend(raw.into_iter().map(|r| {
+    for (i, r) in raw.into_iter().enumerate() {
         let nc = r.name.chars().count();
         let pad = if nc < name_w {
             " ".repeat(name_w - nc)
         } else {
             String::new()
         };
-        ListItem::new(Line::from(vec![
+        let mut lines: Vec<Line> = vec![Line::from(vec![
             r.dot,
             Span::styled(r.name, r.name_style),
             Span::raw(pad),
@@ -265,8 +265,44 @@ fn render_projects(f: &mut Frame, area: Rect, app: &App) {
             Span::styled(center(&r.subs, subs_w), r.subs_style),
             Span::styled(" │ ", Style::new().fg(border())),
             Span::styled(center(&r.notes, notes_w), r.notes_style),
-        ]))
-    }));
+        ])];
+
+        if app.project_info && i == app.project_idx {
+            if let Some(p) = app.current_project() {
+                lines.push(Line::from(""));
+                lines.push(Line::from(vec![
+                    Span::styled("   created  ", Style::new().fg(subtle())),
+                    Span::styled(p.created.format("%Y-%m-%d").to_string(), Style::new().fg(text())),
+                ]));
+                if !p.description.is_empty() {
+                    lines.push(Line::from(vec![
+                        Span::styled("   desc     ", Style::new().fg(subtle())),
+                        Span::styled(p.description.clone(), Style::new().fg(text())),
+                    ]));
+                }
+                if let Some(repo) = &p.repo {
+                    lines.push(Line::from(vec![
+                        Span::styled("   repo     ", Style::new().fg(subtle())),
+                        Span::styled(repo.clone(), Style::new().fg(blue())),
+                    ]));
+                }
+                if !p.milestones.is_empty() {
+                    let done = p.milestones.iter().filter(|m| m.done).count();
+                    let total = p.milestones.len();
+                    let style = if done == total {
+                        Style::new().fg(green())
+                    } else {
+                        Style::new().fg(subtle())
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled("   milestones", Style::new().fg(subtle())),
+                        Span::styled(format!("  {done}/{total}"), style),
+                    ]));
+                }
+            }
+        }
+        items.push(ListItem::new(lines));
+    }
 
     let list = List::new(items)
         .block(block)

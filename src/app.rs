@@ -169,12 +169,18 @@ pub struct ThemeState {
     pub saved: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HelpTab {
+    General,
+    Main,
+}
+
 pub enum Mode {
     Normal,
     Input(Box<InputState>),
     Confirm(ConfirmState),
     EditBody(Box<EditState>),
-    Help,
+    Help(HelpTab),
     GitHub,
     Theme(ThemeState),
     /// A dismissible message popup — (title, body). Used for sync results.
@@ -646,7 +652,16 @@ impl App {
             Mode::Confirm(_) => self.handle_confirm(key),
             Mode::EditBody(_) => self.handle_edit_body(key),
             Mode::Theme(_) => self.handle_theme(key),
-            Mode::Help | Mode::GitHub | Mode::Notice(..) => self.mode = Mode::Normal,
+            Mode::Help(_) => match key.code {
+                KeyCode::Left | KeyCode::Char('h') => {
+                    self.mode = Mode::Help(HelpTab::General);
+                }
+                KeyCode::Right | KeyCode::Char('l') => {
+                    self.mode = Mode::Help(HelpTab::Main);
+                }
+                _ => self.mode = Mode::Normal,
+            },
+            Mode::GitHub | Mode::Notice(..) => self.mode = Mode::Normal,
         }
     }
 
@@ -767,7 +782,7 @@ impl App {
 
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
-            KeyCode::Char('?') => self.mode = Mode::Help,
+            KeyCode::Char('?') => self.mode = Mode::Help(HelpTab::General),
             // Tab switches the content view (Overview / Todos / Notes / Schedule).
             KeyCode::Tab => self.cycle_tab(true),
             KeyCode::BackTab => self.cycle_tab(false),

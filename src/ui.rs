@@ -12,7 +12,8 @@ use ratatui::{
 };
 
 use crate::app::{
-    App, ConfirmState, Focus, InputState, Mode, PaneRects, Tab, ThemeState, TimelineEntry, TlKind,
+    App, ConfirmState, Focus, HelpTab, InputState, Mode, PaneRects, Tab, ThemeState, TimelineEntry,
+    TlKind,
 };
 use crate::model::Priority;
 use crate::theme::{accent, bg, blue, border, green, on_accent, red, sel_bg, subtle, text, yellow};
@@ -83,7 +84,7 @@ pub fn render(f: &mut Frame, app: &App) {
     match &app.mode {
         Mode::Input(input) => render_input(f, area, input),
         Mode::Confirm(c) => render_confirm(f, area, c),
-        Mode::Help => render_help(f, area),
+        Mode::Help(tab) => render_help(f, area, *tab),
         Mode::GitHub => render_github(f, area, app),
         Mode::Theme(state) => render_theme(f, area, state),
         Mode::Notice(title, body) => render_notice(f, area, title, body),
@@ -93,7 +94,7 @@ pub fn render(f: &mut Frame, app: &App) {
 }
 
 fn render_header(f: &mut Frame, area: Rect, app: &App) {
-    let cols = Layout::horizontal([Constraint::Min(0), Constraint::Length(13)]).split(area);
+    let cols = Layout::horizontal([Constraint::Min(0), Constraint::Length(28)]).split(area);
     let n = app.store.projects.len();
     let done = app
         .store
@@ -115,7 +116,7 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
     ];
     let title = Line::from(spans);
     let date = Line::from(Span::styled(
-        format!("{}  ", Local::now().date_naive()),
+        format!("{}  ", Local::now().format("%A, %B %d, %Y")),
         Style::new().fg(subtle()),
     ))
     .right_aligned();
@@ -515,6 +516,28 @@ fn render_todos(f: &mut Frame, area: Rect, app: &App) {
     }
 
     let today = Local::now().date_naive();
+    let block = if let Some(t) = project.todos.get(app.todo_idx) {
+        let footer = if let Some(d) = t.due {
+            let style = if !t.done && d < today {
+                Style::new().fg(red()).bold()
+            } else if d == today {
+                Style::new().fg(green())
+            } else {
+                Style::new().fg(subtle())
+            };
+            let label = if d == today {
+                "due today".to_string()
+            } else {
+                format!("due {}", d.format("%b %d"))
+            };
+            block.title_bottom(Line::from(Span::styled(format!(" {label} "), style)))
+        } else {
+            block
+        };
+        footer
+    } else {
+        block
+    };
     let items: Vec<ListItem> = project
         .todos
         .iter()
@@ -590,6 +613,25 @@ fn render_subtasks(f: &mut Frame, area: Rect, app: &App) {
         format!(" Subtasks · {parent_name} ")
     };
     let block = panel(title, focused);
+
+    let today = Local::now().date_naive();
+    let block = if let Some(d) = todo.due {
+        let style = if !todo.done && d < today {
+            Style::new().fg(red()).bold()
+        } else if d == today {
+            Style::new().fg(green())
+        } else {
+            Style::new().fg(subtle())
+        };
+        let label = if d == today {
+            "due today".to_string()
+        } else {
+            format!("due {}", d.format("%b %d"))
+        };
+        block.title_bottom(Line::from(Span::styled(format!(" {label} "), style)))
+    } else {
+        block
+    };
 
     if todo.subtasks.is_empty() {
         f.render_widget(
@@ -751,6 +793,24 @@ fn render_timeline(f: &mut Frame, area: Rect, app: &App) {
     let today = Local::now().date_naive();
     let entries = app.timeline();
 
+    let block = if let Some(e) = entries.get(app.timeline_idx) {
+        let style = if !e.done && e.date < today {
+            Style::new().fg(red()).bold()
+        } else if e.date == today {
+            Style::new().fg(green())
+        } else {
+            Style::new().fg(subtle())
+        };
+        let label = if e.date == today {
+            "today".to_string()
+        } else {
+            rel(e.date, today)
+        };
+        block.title_bottom(Line::from(Span::styled(format!(" {label} "), style)))
+    } else {
+        block
+    };
+
     let make_item = |e: &TimelineEntry| -> ListItem {
         let (icon, icon_style) = match e.kind {
             TlKind::Milestone => ("◆ ", Style::new().fg(accent())),
@@ -836,10 +896,10 @@ fn context_hints(app: &App) -> &'static str {
 fn render_footer(f: &mut Frame, area: Rect, app: &App) {
     // vim-style mode + location segments on the left.
     let (mode_label, mode_color) = match &app.mode {
-        Mode::Input(_) | Mode::EditBody(_) => ("INSERT", green()),
+        Mode::Input(_) | Mode::EditBody(_) => ("I", green()),
         Mode::Confirm(_) => ("CONFIRM", red()),
         Mode::Notice(..) => ("NOTICE", red()),
-        Mode::Normal | Mode::Help | Mode::GitHub | Mode::Theme(_) => ("NORMAL", accent()),
+        Mode::Normal | Mode::Help(_) | Mode::GitHub | Mode::Theme(_) => ("N", accent()),
     };
     let pane_label = match app.focus {
         Focus::Projects => "PROJECTS",
@@ -870,22 +930,22 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
     if app.sync_in_flight {
         spans.push(Span::styled(
             " \u{f021} ",
-            Style::new().fg(on_accent()).bg(yellow()).bold(),
+            Style::new().fg(yellow()).bold(),
         ));
     } else if app.sync_ready() {
         spans.push(Span::styled(
             " \u{f09b} ",
-            Style::new().fg(green()).bg(sel_bg()).bold(),
+            Style::new().fg(green()).bold(),
         ));
         if app.sync_pending > 0 {
             spans.push(Span::styled(
                 format!(" \u{f0ee} {} ", app.sync_pending),
-                Style::new().fg(yellow()).bg(sel_bg()),
+                Style::new().fg(yellow()),
             ));
         } else if let Some(t) = app.last_sync {
             spans.push(Span::styled(
                 format!(" \u{f00c} {} ", rel_time(t)),
-                Style::new().fg(subtle()).bg(sel_bg()),
+                Style::new().fg(subtle()),
             ));
         }
     }
@@ -907,7 +967,13 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
             "j / k  preview    enter  apply    esc  cancel",
             Style::new().fg(subtle()),
         )),
-        Mode::Help | Mode::GitHub | Mode::Notice(..) => {
+        Mode::Help(_) => {
+            spans.push(Span::styled(
+                "← → tabs · any key close",
+                Style::new().fg(subtle()),
+            ))
+        }
+        Mode::GitHub | Mode::Notice(..) => {
             spans.push(Span::styled("any key  close", Style::new().fg(subtle())))
         }
         Mode::Normal => {
@@ -1063,10 +1129,10 @@ fn render_confirm(f: &mut Frame, area: Rect, c: &ConfirmState) {
     );
 }
 
-fn render_help(f: &mut Frame, area: Rect) {
-    // ("", "HEADING") = section header · ("", "") = blank · (key, desc) = binding
+fn render_help(f: &mut Frame, area: Rect, tab: HelpTab) {
     type Row = (&'static str, &'static str);
-    const COL1: &[Row] = &[
+
+    const GENERAL_COL1: &[Row] = &[
         ("", "MOVE"),
         ("h j k l", "move / switch pane"),
         ("w  s", "prev / next project"),
@@ -1077,20 +1143,16 @@ fn render_help(f: &mut Frame, area: Rect) {
         ("", ""),
         ("", "GENERAL"),
         ("?  q", "help · quit"),
-        ("^t", "change theme"),
-        ("^e", "edit settings file"),
-        ("^y", "sync to GitHub"),
-        ("^g", "link project's repo"),
         ("click", "focus pane / row"),
         ("", ""),
         ("", "QUICK-ADD (todo)"),
         ("!1 !2 !3", "priority"),
         ("@date", "due  (YYYY-MM-DD)"),
     ];
-    const COL2: &[Row] = &[
+    const GENERAL_COL2: &[Row] = &[
         ("", "PROJECTS"),
         ("a  r  d", "add / rename / del"),
-        ("l", "open project"),
+        ("l  i", "open · info"),
         ("o", "show repo activity"),
         ("", ""),
         ("", "OVERVIEW"),
@@ -1105,7 +1167,7 @@ fn render_help(f: &mut Frame, area: Rect) {
         ("f", "cycle date filter"),
         ("l", "jump to the todo"),
     ];
-    const COL3: &[Row] = &[
+    const GENERAL_COL3: &[Row] = &[
         ("", "TODOS / SUBTASKS"),
         ("a  e  d", "add / edit / delete"),
         ("x / space", "toggle done"),
@@ -1124,6 +1186,24 @@ fn render_help(f: &mut Frame, area: Rect) {
         ("space", "expand / collapse"),
         ("e  i", "edit  (^s = save)"),
     ];
+
+    const MAIN_COL1: &[Row] = &[
+        ("", "SYSTEM"),
+        ("^c", "quit"),
+        ("^e", "edit settings file"),
+        ("^t", "change theme"),
+        ("", ""),
+        ("", "SYNC"),
+        ("^y", "sync to GitHub"),
+        ("^g", "link project's repo"),
+    ];
+    const MAIN_COL2: &[Row] = &[
+        ("", "NOTE BODY"),
+        ("^d", "scroll down ½ page"),
+        ("^u", "scroll up ½ page"),
+        ("^s", "save & close editor"),
+    ];
+    const MAIN_COL3: &[Row] = &[];
 
     let render_col = |rows: &[Row]| -> Vec<Line<'static>> {
         rows.iter()
@@ -1145,9 +1225,14 @@ fn render_help(f: &mut Frame, area: Rect) {
             .collect()
     };
 
-    let rows = COL1.len().max(COL2.len()).max(COL3.len());
+    let (c1, c2, c3) = match tab {
+        HelpTab::General => (GENERAL_COL1, GENERAL_COL2, GENERAL_COL3),
+        HelpTab::Main => (MAIN_COL1, MAIN_COL2, MAIN_COL3),
+    };
+
+    let rows = c1.len().max(c2.len()).max(c3.len());
     let width = 110u16.min(area.width);
-    let height = (rows as u16 + 2).min(area.height);
+    let height = (rows as u16 + 4).min(area.height);
     let rect = popup(area, width, height);
     overlay(f, rect);
 
@@ -1159,12 +1244,38 @@ fn render_help(f: &mut Frame, area: Rect) {
             " Keybindings ",
             Style::new().fg(accent()).bold(),
         ))
-        .title(
-            Line::from(Span::styled(" any key closes ", Style::new().fg(subtle()))).right_aligned(),
-        )
         .padding(Padding::horizontal(2));
     let inner = block.inner(rect);
     f.render_widget(block, rect);
+
+    let tab_row = Layout::vertical([Constraint::Length(2), Constraint::Min(0)]).split(inner);
+
+    let tab_labels = [" General ", " Main "];
+    let tab_spans: Vec<Span> = tab_labels
+        .iter()
+        .enumerate()
+        .flat_map(|(i, label)| {
+            let is_active = (i == 0 && tab == HelpTab::General)
+                || (i == 1 && tab == HelpTab::Main);
+            let style = if is_active {
+                Style::new().fg(accent()).bold()
+            } else {
+                Style::new().fg(subtle())
+            };
+            let sep = if i > 0 {
+                vec![Span::styled(" │ ", Style::new().fg(border()))]
+            } else {
+                vec![]
+            };
+            sep.into_iter()
+                .chain(std::iter::once(Span::styled(*label, style)))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    f.render_widget(
+        Paragraph::new(Line::from(tab_spans)),
+        tab_row[0],
+    );
 
     let cols = Layout::horizontal([
         Constraint::Ratio(1, 3),
@@ -1172,10 +1283,10 @@ fn render_help(f: &mut Frame, area: Rect) {
         Constraint::Ratio(1, 3),
     ])
     .spacing(2)
-    .split(inner);
-    f.render_widget(Paragraph::new(render_col(COL1)), cols[0]);
-    f.render_widget(Paragraph::new(render_col(COL2)), cols[1]);
-    f.render_widget(Paragraph::new(render_col(COL3)), cols[2]);
+    .split(tab_row[1]);
+    f.render_widget(Paragraph::new(render_col(c1)), cols[0]);
+    f.render_widget(Paragraph::new(render_col(c2)), cols[1]);
+    f.render_widget(Paragraph::new(render_col(c3)), cols[2]);
 }
 
 fn render_github(f: &mut Frame, area: Rect, app: &App) {

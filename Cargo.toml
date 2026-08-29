@@ -1,5 +1,5 @@
 [package]
-name = "shiki"
+name = "voido"
 version = "0.1.0"
 edition = "2024"
 
@@ -13,3 +13,4 @@ tui-textarea = "0.7"
 pulldown-cmark = { version = "0.12", default-features = false }
 reqwest = { version = "0.12", features = ["blocking", "json"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
+base64 = "0.22"

@@ -6,11 +6,11 @@
 
 use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::{
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
 };
 
-use crate::ui::{ACCENT, BLUE, BORDER, GREEN, SUBTLE, YELLOW};
+use crate::theme::{accent, blue, border, green, sel_bg, subtle, text, yellow};
 
 /// Render `src` as styled lines sized for a `width`-column pane.
 pub fn render(src: &str, width: u16) -> Vec<Line<'static>> {
@@ -26,7 +26,7 @@ pub fn render(src: &str, width: u16) -> Vec<Line<'static>> {
 }
 
 fn code_style() -> Style {
-    Style::new().fg(YELLOW).bg(Color::Rgb(40, 41, 56))
+    Style::new().fg(yellow()).bg(sel_bg())
 }
 
 struct Renderer {
@@ -100,16 +100,18 @@ impl Renderer {
                 self.want_blank = true;
                 self.flush_blank();
                 let n = self.width.saturating_sub(2).clamp(3, 72);
-                self.lines
-                    .push(Line::from(Span::styled("─".repeat(n), Style::new().fg(BORDER))));
+                self.lines.push(Line::from(Span::styled(
+                    "─".repeat(n),
+                    Style::new().fg(border()),
+                )));
                 self.want_blank = true;
             }
             Event::TaskListMarker(done) => {
                 self.ensure_line();
                 let (glyph, style) = if done {
-                    ("[x] ", Style::new().fg(GREEN))
+                    ("[x] ", Style::new().fg(green()))
                 } else {
-                    ("[ ] ", Style::new().fg(SUBTLE))
+                    ("[ ] ", Style::new().fg(subtle()))
                 };
                 self.spans.push(Span::styled(glyph, style));
             }
@@ -166,7 +168,8 @@ impl Renderer {
                     _ => "• ".to_string(),
                 };
                 self.ensure_line();
-                self.spans.push(Span::styled(marker, Style::new().fg(ACCENT)));
+                self.spans
+                    .push(Span::styled(marker, Style::new().fg(accent())));
             }
             Tag::Emphasis => self.italic += 1,
             Tag::Strong => self.bold += 1,
@@ -174,7 +177,8 @@ impl Renderer {
             Tag::Link { .. } => self.link += 1,
             Tag::Image { .. } => {
                 self.ensure_line();
-                self.spans.push(Span::styled("🖼 ", Style::new().fg(SUBTLE)));
+                self.spans
+                    .push(Span::styled("🖼 ", Style::new().fg(subtle())));
             }
             _ => {}
         }
@@ -236,17 +240,17 @@ impl Renderer {
         if let Some(level) = self.heading {
             return match level {
                 HeadingLevel::H1 => Style::new()
-                    .fg(ACCENT)
+                    .fg(accent())
                     .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-                HeadingLevel::H2 => Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
-                _ => Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
+                HeadingLevel::H2 => Style::new().fg(accent()).add_modifier(Modifier::BOLD),
+                _ => Style::new().fg(text()).add_modifier(Modifier::BOLD),
             };
         }
 
         let mut s = if self.quote > 0 {
-            Style::new().fg(SUBTLE).add_modifier(Modifier::ITALIC)
+            Style::new().fg(subtle()).add_modifier(Modifier::ITALIC)
         } else {
-            Style::new().fg(Color::White)
+            Style::new().fg(text())
         };
         if self.bold > 0 {
             s = s.add_modifier(Modifier::BOLD);
@@ -258,7 +262,7 @@ impl Renderer {
             s = s.add_modifier(Modifier::CROSSED_OUT);
         }
         if self.link > 0 {
-            s = s.fg(BLUE).add_modifier(Modifier::UNDERLINED);
+            s = s.fg(blue()).add_modifier(Modifier::UNDERLINED);
         }
         s
     }
@@ -275,7 +279,7 @@ impl Renderer {
         if pre.is_empty() {
             None
         } else {
-            Some(Span::styled(pre, Style::new().fg(BORDER)))
+            Some(Span::styled(pre, Style::new().fg(border())))
         }
     }
 
@@ -322,13 +326,20 @@ mod tests {
     fn plain(src: &str) -> Vec<String> {
         render(src, 40)
             .iter()
-            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
             .collect()
     }
 
     #[test]
     fn headings_lists_quotes() {
-        let out = plain("# Title\n\nsome **bold** text\n\n- one\n- two\n  - nested\n\n> quoted\n\n1. first\n2. second\n");
+        let out = plain(
+            "# Title\n\nsome **bold** text\n\n- one\n- two\n  - nested\n\n> quoted\n\n1. first\n2. second\n",
+        );
         let joined = out.join("\n");
         assert!(joined.contains("Title"));
         assert!(joined.contains("• one"));

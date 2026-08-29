@@ -1,4 +1,4 @@
-//! Data model for shiki: projects, todos and timeline milestones.
+//! Data model for voido: projects, todos and timeline milestones.
 
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
@@ -21,6 +21,15 @@ impl Priority {
         }
     }
 
+    /// Parse a stored label back into a `Priority` (anything unknown -> Medium).
+    pub fn from_label(s: &str) -> Self {
+        match s {
+            "low" => Priority::Low,
+            "high" => Priority::High,
+            _ => Priority::Medium,
+        }
+    }
+
     /// Cycle low -> med -> high -> low.
     pub fn next(self) -> Self {
         match self {
@@ -36,11 +45,17 @@ pub struct Subtask {
     pub title: String,
     #[serde(default)]
     pub done: bool,
+    #[serde(default)]
+    pub priority: Priority,
 }
 
 impl Subtask {
     pub fn new(title: impl Into<String>, done: bool) -> Self {
-        Self { title: title.into(), done }
+        Self {
+            title: title.into(),
+            done,
+            priority: Priority::Medium,
+        }
     }
 }
 
@@ -138,6 +153,18 @@ impl Project {
         }
     }
 
+    /// A project reads as complete only once it has at least one tracked item
+    /// and every todo, subtask and milestone in it is done.
+    pub fn is_complete(&self) -> bool {
+        let has_items = !self.todos.is_empty() || !self.milestones.is_empty();
+        has_items
+            && self
+                .todos
+                .iter()
+                .all(|t| t.done && t.subtasks.iter().all(|s| s.done))
+            && self.milestones.iter().all(|m| m.done)
+    }
+
     pub fn open_todos(&self) -> usize {
         self.todos.iter().filter(|t| !t.done).count()
     }
@@ -178,7 +205,10 @@ impl Store {
         ];
         website.todos = vec![
             done(Todo::new("Audit current pages")),
-            due(prio(Todo::new("Design system in Figma"), Priority::High), day(3)),
+            due(
+                prio(Todo::new("Design system in Figma"), Priority::High),
+                day(3),
+            ),
             home,
             due(Todo::new("Ship to staging"), day(9)),
         ];
@@ -208,11 +238,19 @@ See the [thread](mailto:team@example.com) for the full notes.
             Note::new("Reuse the icon set from the app", false),
         ];
         website.milestones = vec![
-            Milestone { title: "Design review".into(), date: day(5), done: false },
-            Milestone { title: "Public launch".into(), date: day(21), done: false },
+            Milestone {
+                title: "Design review".into(),
+                date: day(5),
+                done: false,
+            },
+            Milestone {
+                title: "Public launch".into(),
+                date: day(21),
+                done: false,
+            },
         ];
 
-        let mut cli = Project::new("Shiki CLI");
+        let mut cli = Project::new("Voido CLI");
         cli.description = "A keyboard-first TUI for todos, projects and timelines".into();
         cli.todos = vec![
             done(Todo::new("Vim-style navigation")),
@@ -224,9 +262,15 @@ See the [thread](mailto:team@example.com) for the full notes.
                 "# Keymap\n\nKeep it **close to Vim** — no surprises.\n\n- `hjkl` everywhere\n- `gg` / `G` to jump\n- `d` always asks first\n",
             ),
         ];
-        cli.milestones = vec![Milestone { title: "v0.1 release".into(), date: day(7), done: false }];
+        cli.milestones = vec![Milestone {
+            title: "v0.1 release".into(),
+            date: day(7),
+            done: false,
+        }];
 
-        Store { projects: vec![website, cli] }
+        Store {
+            projects: vec![website, cli],
+        }
     }
 }
 
@@ -243,4 +287,38 @@ fn prio(mut t: Todo, p: Priority) -> Todo {
 fn due(mut t: Todo, d: NaiveDate) -> Todo {
     t.due = Some(d);
     t
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_complete_needs_every_child_done() {
+        let empty = Project::new("empty");
+        assert!(!empty.is_complete(), "no items -> not complete");
+
+        let mut p = Project::new("P");
+        let mut t1 = Todo::new("t1");
+        t1.subtasks = vec![Subtask::new("s1", true), Subtask::new("s2", false)];
+        let mut t2 = Todo::new("t2");
+        t2.done = true;
+        p.todos = vec![t1, t2];
+        p.milestones = vec![Milestone {
+            title: "m".into(),
+            date: NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+            done: true,
+        }];
+
+        assert!(!p.is_complete(), "t1 not done, s2 not done");
+
+        p.todos[0].done = true;
+        assert!(!p.is_complete(), "s2 still not done");
+
+        p.todos[0].subtasks[1].done = true;
+        assert!(p.is_complete(), "everything done now");
+
+        p.milestones[0].done = false;
+        assert!(!p.is_complete(), "milestone reopened");
+    }
 }

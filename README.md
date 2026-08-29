@@ -1,24 +1,114 @@
-# shiki
+# voido
 
 A keyboard-first terminal app for **projects, todos, subtasks, notes and
 timelines**, with Vim-style navigation. Built with Rust + [ratatui](https://ratatui.rs).
 
 ```
-cargo run           # or: cargo build --release && ./target/release/shiki
+cargo run           # or: cargo build --release && ./target/release/voido
 ```
 
-Data is stored as pretty JSON at `~/Library/Application Support/shiki/data.json`
-(macOS) / `~/.local/share/shiki/data.json` (Linux) and saved automatically.
+Data is stored in a SQLite database at `~/Library/Application Support/voido/voido.db`
+(macOS) / `~/.local/share/voido/voido.db` (Linux) and saved automatically after
+every change (each write is a single transaction). A legacy `data.json` from an
+older version is imported automatically on first run.
+
+### GitHub sync
+
+voido can keep a copy of your data in a GitHub repo — it pulls the latest on
+startup and pushes on exit (and on demand with `^y`).
+
+**If you have the [`gh` CLI](https://cli.github.com) set up** (`gh auth login`),
+it's zero config: press `^y`, hit Enter to accept `voido-data`, and voido
+creates the private repo and syncs. Same deal if `GITHUB_TOKEN` / `GH_TOKEN` is
+in your environment.
+
+**Otherwise** `^y` asks for a repo (`owner/repo` or just a name) and a token —
+classic PAT with **`repo`** scope, or fine-grained with **Contents: read and
+write**. voido creates the repo if it's under your account and doesn't exist yet.
+
+- Token precedence: the one you enter in `^y` → `gh auth token` → environment.
+  Only a token you type is written to config.
+- Conflicts are last-write-wins (whichever machine exits last).
+- A failed sync pops a dialog with GitHub's exact error.
+
+#### Settings file
+
+Hand-editable JSON at `~/Library/Application Support/voido/config.json` (macOS) /
+`~/.config/voido/config.json` (Linux). Every key is optional — omit one (or set
+it to `null`) for the default.
+
+```json
+{
+  "storage": "github",
+  "github_repo": "me/my-notes",
+  "github_file": "notes.json",
+  "github_token": null
+}
+```
+
+| key | default | meaning |
+| --- | --- | --- |
+| `storage` | `"local"` | `"local"` or `"github"` (turns sync on) |
+| `github_repo` | – | `owner/repo`, or a bare name (owner = the token's account) |
+| `github_file` | `voido-data.json` | name of the data file inside the repo; subpaths like `data/notes.json` work |
+| `github_token` | `null` | leave `null` to use `gh` / `$GITHUB_TOKEN` |
+
+`^y` writes `storage` and `github_repo` for you; set `github_file` yourself if you
+want the synced file called something else. Changing it just starts a fresh file
+under the new name (the old one is left in the repo). If the file is malformed,
+voido refuses to start rather than overwrite your edits.
+
+Press **`^e`** in the app to open this file in `$VISUAL` / `$EDITOR` (or `vi`);
+it's reloaded when you close the editor.
+
+### Themes
+
+Press **`^t`** for the theme picker — `j`/`k` previews live, `enter` keeps it,
+`esc` reverts. The choice is saved as `"theme"` in the settings file, so you can
+also set it there directly. Bundled: Catppuccin (Mocha / Latte), Tokyo Night,
+Dracula, Nord, Gruvbox (Dark / Light), One Dark, Rosé Pine, Solarized
+(Dark / Light).
+
+Add your own in the settings file — they show up in the picker alongside the
+built-ins:
+
+```json
+"themes": [
+  {
+    "name": "My Neon",
+    "accent": "#ff00ff", "green": "#00ff88", "red": "#ff3355",
+    "yellow": "#ffee00", "blue": "#22ddff", "text": "#e8e8ff",
+    "subtle": "#7a7a99", "border": "#333355", "sel_bg": "#222244",
+    "bg": "#0a0a14"
+  }
+]
+```
+
+All slots take `#rrggbb`. `on_accent` (text on a colour fill) is optional and
+defaults to `bg`. The name is slugified for the `"theme"` key (`My Neon` →
+`my-neon`); reuse a built-in's slug to override it. A theme that fails to parse
+is skipped with a message on startup.
+
+### GitHub activity
+
+The resolved token also lifts the anonymous rate limit on the repo-activity view
+(`^g` to link a code repo, `o` to view).
+
+A project shows `✔` (struck through) once every todo, subtask and milestone in
+it is done — it can't be ticked on its own.
 
 ## Layout
 
 ```
- ┌ Projects ─┐┌ <project> · Overview Todos Notes Timeline ─┐┌ Subtasks 1/3 ┐
- │ ● Website ││ ○ Design system in Figma  high  Sep 01     ││ ✔ Hero        │
- │ ● Shiki   ││ ○ Rebuild the home page   ⊞ 1/3            ││ ○ Nav+footer  │
- └───────────┘└────────────────────────────────────────────┘└──────────────┘
-  status                                          context-sensitive key hints
+ ╭ Projects ─╮╭ Overview  Todos  Notes  Schedule ─── Website ╮╭ Subtasks 1/3 ╮
+ │ ● Website ││ ○ Design system in Figma   high   Sep 01     ││ ✔ Hero        │
+ │ ● Voido   ││ ○ Rebuild the home page    med  ⊞ 1/3        ││ ○ Nav+footer  │
+ ╰───────────╯╰──────────────────────────────────────────────╯╰──────────────╯
+  NORMAL  TODOS   <status>   context key hints          Website > todos
 ```
+
+The middle pane's tabs live on its top border. Left rail is the project list;
+the right pane shows subtasks (Todos) or the note body (Notes).
 
 - **Overview** — description, todo/subtask progress bar, note count, next milestone
 - **Todos** — checkbox, priority, due date, subtask progress; `l` opens the
@@ -32,17 +122,21 @@ Data is stored as pretty JSON at `~/Library/Application Support/shiki/data.json`
 
 ## Keys
 
+`h` `j` `k` `l` (and the arrows) move — `h`/`l` also step between the three
+panes. Click a pane, tab, or row to jump there; the wheel scrolls. Press `?` any
+time for the full list.
+
 | Scope | Keys |
 | --- | --- |
-| Global | `1` `2` `3` focus panel (projects / middle / right) · `tab` cycle · `t`/`T` next/prev tab · `gg`/`G` top/bottom · `?` help · `q` quit |
-| Projects | `j`/`k` move · `a` add · `r` rename · `d` delete · `l`/`enter` open |
-| Todos | `j`/`k` move · `a` add · `e` edit · `x` done · `p` priority · `J`/`K` reorder · `l` subtasks · `d` delete |
-| Subtasks | `j`/`k` move · `a` add · `e` edit · `x` done · `J`/`K` reorder · `d` delete · `h` back |
-| Notes | `j`/`k` move · `a` add · `e` edit title · `x` pin · `J`/`K` reorder · `l` open · `d` delete |
-| Note body | `j`/`k` scroll · `^d`/`^u` page · `e` edit Markdown · `h` back |
+| Global | `h`/`l` switch pane · `w`/`s` prev/next project · `tab`/`S-tab` switch view · `1`‑`4` jump to a view · `gg`/`G` top/bottom · `esc` back out · `^t` theme · `^y` GitHub sync · `^e` edit settings file · `?` help · `q` quit |
+| Projects | `a` add · `r` rename · `d` delete · `l` open · `^g` link/unlink code repo · `o` repo activity |
+| Overview | `e` edit description · `r` rename |
+| Todos | `a` add · `e` edit · `d` delete · `x` (or space) done · `p` priority · `J`/`K` reorder · `l` subtasks |
+| Subtasks | `a` add · `e` edit · `d` delete · `x` done · `p` priority · `J`/`K` reorder · `h` back |
+| Notes | `a` add · `e` edit title · `d` delete · `x` pin · `J`/`K` reorder · `l` open body |
+| Note body | `j`/`k` · `^d`/`^u` scroll · `space` expand · `e` edit · `h` back |
 | MD editor | type freely · `esc` / `^s` save & close |
-| Timeline | `j`/`k` move · `a` add milestone · `e`/`x`/`d` edit/toggle/delete milestone |
-| Overview | `e` edit description · `r` rename project |
+| Schedule | `a` add milestone · `e`/`d` edit/delete · `x` done · `r` reschedule · `f` cycle filter · `l` jump to todo |
 
 ### Quick-add syntax
 

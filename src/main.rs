@@ -1,4 +1,4 @@
-//! shiki — a keyboard-first TUI for todos, projects and timelines.
+//! voido — a keyboard-first TUI for todos, projects and timelines.
 
 mod app;
 mod config;
@@ -7,157 +7,343 @@ mod md;
 mod model;
 mod storage;
 mod storage_sqlite;
+mod theme;
 mod ui;
+mod util;
 
 use std::error::Error;
+use std::io::Write;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use app::App;
-use config::{Config, StorageChoice};
+use config::Config;
 use ratatui::{
     DefaultTerminal,
-    crossterm::event::{self, Event, KeyEventKind},
+    crossterm::{
+        event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind},
+        execute,
+    },
 };
+use storage_sqlite::SqliteStorage;
 
 fn main() -> Result<(), Box<dyn Error>> {
+    migrate_legacy_dirs();
     let config = ensure_config()?;
-    let store = load_store(&config)?;
+    theme::init(
+        config
+            .themes
+            .iter()
+            .filter_map(|spec| match spec.build() {
+                Ok(entry) => Some(entry),
+                Err(e) => {
+                    eprintln!("voido: ignoring custom theme \"{}\" — {e}", spec.name);
+                    None
+                }
+            })
+            .collect(),
+    );
+    theme::set_slug(config.theme.as_deref());
+
+    let db = match SqliteStorage::open(&db_path()) {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!("voido: could not open the database: {e}");
+            eprintln!(
+                "voido: the file at {} may be corrupt — move it aside to start fresh.",
+                db_path().display()
+            );
+            return Err(e.into());
+        }
+    };
+
+    let mut store = match load_store(&db) {
+        Ok(store) => store,
+        Err(e) => {
+            eprintln!("voido: could not load your data: {e}");
+            eprintln!(
+                "voido: the database at {} may be corrupt — move it aside to start fresh.",
+                db_path().display()
+            );
+            return Err(e.into());
+        }
+    };
+
+    // Resolve a token once (config value, then `gh` CLI, then environment).
+    let token = github::resolve_token(config.github_token.as_deref());
+
+    // Pull the latest from GitHub before the UI opens, when sync is set up.
+    let mut sync_sha = None;
+    if config.sync_configured() {
+        if let Some(token) = token.as_deref() {
+            eprint!("voido: syncing with GitHub… ");
+            let _ = std::io::stderr().flush();
+            match sync_pull(&config, token) {
+                Ok(Some((remote, sha))) => {
+                    store = remote;
+                    if let Err(e) = db.save(&store) {
+                        eprintln!("(local save failed: {e})");
+                    } else {
+                        eprintln!("pulled latest.");
+                    }
+                    sync_sha = Some(sha);
+                }
+                Ok(None) => eprintln!("no data in the repo yet — it will be created on exit."),
+                Err(e) => eprintln!("pull failed ({e}) — starting from local data."),
+            }
+        } else {
+            eprintln!(
+                "voido: GitHub sync is on but no token was found — run `gh auth login`, set \
+                 GITHUB_TOKEN, or press ^y in the app."
+            );
+        }
+    }
+
     let mut terminal = ratatui::init();
-    let mut app = App::new(store);
-    let result = run(&mut terminal, &mut app, &config);
+    let _ = execute!(std::io::stdout(), EnableMouseCapture);
+    let mut app = App::new(store, config, sync_sha, token);
+    let result = run(&mut terminal, &mut app, &db);
+    let _ = execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
 
-    if let Err(e) = save_store(&app.store, &config) {
-        eprintln!("shiki: could not save data: {e}");
+    // Best-effort final local save, even if the loop bailed with an error.
+    if let Err(e) = db.save(&app.store) {
+        eprintln!("voido: could not save data: {e}");
     }
+
+    // Persist any settings changed in-app (e.g. sync just configured).
+    let _ = app.config.save();
+
+    // Push to GitHub on the way out.
+    if app.sync_ready() {
+        let token = app.sync_token.clone().unwrap_or_default();
+        match sync_push(&app.config, &token, &app.store, app.sync_sha.as_deref()) {
+            Ok(_) => eprintln!("voido: synced with GitHub."),
+            Err(e) => eprintln!("voido: GitHub push failed: {e}"),
+        }
+    }
+
     result
 }
 
 fn ensure_config() -> Result<Config, Box<dyn Error>> {
-    if let Some(config) = Config::load() {
-        return Ok(config);
+    match Config::load() {
+        Ok(Some(config)) => return Ok(config),
+        Ok(None) => {}
+        Err(e) => {
+            eprintln!("voido: your settings file couldn't be read — fix or delete it:");
+            eprintln!("voido:   {e}");
+            return Err(e.into());
+        }
     }
 
-    // First launch — prompt user
+    // First run: start local. GitHub sync is a one-keystroke opt-in from inside
+    // the app (`^y`), which auto-detects a `gh` login and creates the repo.
     println!();
-    println!("  Welcome to shiki!");
+    println!("  Welcome to voido — your data lives locally at");
+    println!("    {}", db_path().display());
     println!();
-    println!("  Would you like to sync your data with GitHub?");
-    println!("  (your projects will be stored in a hidden repo called 'voido-data')");
+    println!("  Settings (repo, data-file name, token) are in");
+    println!("    {}", Config::path().display());
     println!();
-    print!("  Use GitHub? [y/N]: ");
+    println!("  To back it up to GitHub, press ^y in the app.");
+    println!();
 
-    use std::io::Write;
-    std::io::stdout().flush()?;
-
-    let mut input = String::new();
-    std::io::stdin().read_line(&mut input)?;
-    let input = input.trim().to_lowercase();
-
-    let config = if input == "y" || input == "yes" {
-        println!();
-        print!("  Enter your GitHub repo (owner/repo) or press Enter for 'voido-data': ");
-        std::io::stdout().flush()?;
-
-        let mut repo = String::new();
-        std::io::stdin().read_line(&mut repo)?;
-        let repo = repo.trim().to_string();
-        let repo = if repo.is_empty() {
-            "voido-data".to_string()
-        } else {
-            repo
-        };
-
-        Config {
-            storage: StorageChoice::GitHub,
-            github_repo: Some(repo),
-        }
-    } else {
-        Config {
-            storage: StorageChoice::Local,
-            github_repo: None,
-        }
-    };
-
+    let config = Config::default();
     config.save()?;
-    println!();
-    println!("  Config saved. Starting shiki...");
-    println!();
-
     Ok(config)
+}
+
+/// Carry over data/config from the app's former name (`shiki`) so an existing
+/// install keeps working after the rename. Best-effort, runs once.
+fn migrate_legacy_dirs() {
+    for base in [dirs::data_dir(), dirs::config_dir()] {
+        let Some(base) = base else { continue };
+        let (old, new) = (base.join("shiki"), base.join("voido"));
+        if old.is_dir() && !new.exists() {
+            let _ = std::fs::rename(&old, &new);
+        }
+        // The database file was named after the app too.
+        let (old_db, new_db) = (new.join("shiki.db"), new.join("voido.db"));
+        if old_db.is_file() && !new_db.exists() {
+            let _ = std::fs::rename(&old_db, &new_db);
+        }
+    }
 }
 
 fn db_path() -> PathBuf {
     let mut dir = dirs::data_dir().unwrap_or_else(|| PathBuf::from("."));
-    dir.push("shiki");
+    dir.push("voido");
     std::fs::create_dir_all(&dir).ok();
-    dir.push("shiki.db");
+    dir.push("voido.db");
     dir
 }
 
-fn load_store(config: &Config) -> Result<model::Store, Box<dyn Error>> {
-    match config.storage {
-        StorageChoice::Local => {
-            // Try SQLite first, fall back to JSON
-            let path = db_path();
-            if path.exists() {
-                let sqlite = storage_sqlite::SqliteStorage::open(&path)?;
-                Ok(sqlite.load())
-            } else {
-                // Try loading from legacy JSON
-                Ok(storage::load())
-            }
+/// Load from SQLite, importing a legacy `data.json` on first run when the
+/// database is still empty.
+fn load_store(db: &SqliteStorage) -> Result<model::Store, String> {
+    let store = db.load()?;
+    if store.projects.is_empty() {
+        let legacy = storage::load();
+        if !legacy.projects.is_empty() {
+            db.save(&legacy)?;
+            return Ok(legacy);
         }
-        StorageChoice::GitHub => {
-            let path = db_path();
-            if path.exists() {
-                let sqlite = storage_sqlite::SqliteStorage::open(&path)?;
-                Ok(sqlite.load())
-            } else {
-                Ok(storage::load())
-            }
+        return Ok(legacy); // seeded sample data
+    }
+    Ok(store)
+}
+
+/// Fetch the synced store from the configured repo. `Ok(None)` = repo reachable
+/// but no data file yet.
+fn sync_pull(config: &Config, token: &str) -> Result<Option<(model::Store, String)>, String> {
+    let client = sync_client(config, token)?;
+    match client.pull()? {
+        Some(remote) => {
+            let store: model::Store = serde_json::from_str(&remote.json)
+                .map_err(|e| format!("remote data is unreadable: {e}"))?;
+            Ok(Some((store, remote.sha)))
         }
+        None => Ok(None),
     }
 }
 
-fn save_store(store: &model::Store, config: &Config) -> Result<(), Box<dyn Error>> {
-    match config.storage {
-        StorageChoice::Local => {
-            let path = db_path();
-            let sqlite = storage_sqlite::SqliteStorage::open(&path)?;
-            sqlite.save(store)?;
+fn sync_push(
+    config: &Config,
+    token: &str,
+    store: &model::Store,
+    sha: Option<&str>,
+) -> Result<String, String> {
+    let client = sync_client(config, token)?;
+    let json = serde_json::to_string_pretty(store).map_err(|e| e.to_string())?;
+    match client.push(&json, sha) {
+        Ok(s) => Ok(s),
+        // File exists / changed since we pulled — refetch its SHA and overwrite.
+        Err(e)
+            if sha.is_none()
+                || e.contains("409")
+                || e.contains("422")
+                || e.contains("conflict") =>
+        {
+            let latest = client.pull()?.map(|r| r.sha);
+            client.push(&json, latest.as_deref())
         }
-        StorageChoice::GitHub => {
-            let path = db_path();
-            let sqlite = storage_sqlite::SqliteStorage::open(&path)?;
-            sqlite.save(store)?;
-            // TODO: Phase 3 — push to GitHub
-        }
+        Err(e) => Err(e),
     }
-    Ok(())
+}
+
+fn sync_client(config: &Config, token: &str) -> Result<github::SyncClient, String> {
+    let repo = config
+        .github_repo
+        .as_deref()
+        .ok_or_else(|| "no sync repo configured".to_string())?;
+    let (owner, name) = match github::parse_repo_string(repo) {
+        Some(pair) => pair,
+        // A bare name — resolve the owner from the token's account.
+        None => (
+            github::authed_login(token)?,
+            repo.trim().trim_matches('/').to_string(),
+        ),
+    };
+    github::SyncClient::new(token, &owner, &name, &config.sync_file())
 }
 
 fn run(
     terminal: &mut DefaultTerminal,
     app: &mut App,
-    _config: &Config,
+    db: &SqliteStorage,
 ) -> Result<(), Box<dyn Error>> {
-    while !app.should_quit {
-        app.clamp();
-        terminal.draw(|frame| ui::render(frame, app))?;
+    app.clamp();
+    terminal.draw(|frame| ui::render(frame, app))?;
 
-        if let Event::Key(key) = event::read()?
-            && key.kind == KeyEventKind::Press
-        {
-            app.handle_key(key);
+    while !app.should_quit {
+        let mut redraw = false;
+
+        if event::poll(Duration::from_millis(200))? {
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    app.handle_key(key);
+                    redraw = true;
+                }
+                Event::Mouse(me) => {
+                    if app.handle_mouse(me) {
+                        redraw = true;
+                    }
+                }
+                Event::Resize(_, _) => redraw = true,
+                _ => {}
+            }
+        }
+
+        // `^e` — drop out of the TUI, run the user's editor on the settings
+        // file, then reload it.
+        if app.open_settings {
+            app.open_settings = false;
+            match edit_settings(terminal) {
+                Ok(()) => match Config::load() {
+                    Ok(Some(cfg)) => {
+                        app.reload_config(cfg);
+                        app.status = "settings reloaded".into();
+                    }
+                    Ok(None) => {}
+                    Err(e) => app.status = format!("settings: {e}"),
+                },
+                Err(e) => app.status = e,
+            }
+            redraw = true;
+        }
+
+        // Pick up results from background work (GitHub fetches, data syncs).
+        if app.poll_background() {
+            redraw = true;
         }
 
         if app.dirty {
-            if let Err(e) = save_store(&app.store, _config) {
+            if let Err(e) = db.save(&app.store) {
                 app.status = format!("save error: {e}");
             }
             app.dirty = false;
+            app.note_unsynced_edit();
+            redraw = true;
+        }
+
+        if redraw {
+            app.clamp();
+            terminal.draw(|frame| ui::render(frame, app))?;
         }
     }
     Ok(())
+}
+
+/// Suspend the TUI, open the settings file in `$VISUAL` / `$EDITOR` (falling
+/// back to `vi`), then restore the terminal. `EDITOR` may include arguments,
+/// e.g. `code -w`.
+fn edit_settings(terminal: &mut DefaultTerminal) -> Result<(), String> {
+    let path = Config::path();
+    let spec = std::env::var("VISUAL")
+        .or_else(|_| std::env::var("EDITOR"))
+        .unwrap_or_else(|_| "vi".to_string());
+    let mut parts = spec.split_whitespace();
+    let Some(program) = parts.next() else {
+        return Err("no editor set — set $EDITOR".into());
+    };
+    let args: Vec<&str> = parts.collect();
+
+    let _ = execute!(std::io::stdout(), DisableMouseCapture);
+    ratatui::restore();
+
+    let status = std::process::Command::new(program)
+        .args(&args)
+        .arg(&path)
+        .status();
+
+    *terminal = ratatui::init();
+    let _ = execute!(std::io::stdout(), EnableMouseCapture);
+    let _ = terminal.clear();
+
+    match status {
+        Ok(s) if s.success() => Ok(()),
+        Ok(s) => Err(format!("{program} exited without saving ({s})")),
+        Err(e) => Err(format!("could not run {program}: {e}")),
+    }
 }

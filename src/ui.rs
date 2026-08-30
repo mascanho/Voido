@@ -111,6 +111,7 @@ pub fn render(f: &mut Frame, app: &App) {
         Mode::Confirm(c) => render_confirm(f, area, c),
         Mode::Help => render_help(f, area),
         Mode::GitHub => render_github(f, area, app),
+        Mode::Weather => render_weather(f, area, app),
         Mode::Theme(state) => render_theme(f, area, state),
         Mode::Notice(title, body) => render_notice(f, area, title, body),
         Mode::Attach(state) => render_attach(f, area, state, app),
@@ -122,7 +123,6 @@ pub fn render(f: &mut Frame, app: &App) {
 }
 
 fn render_header(f: &mut Frame, area: Rect, app: &App) {
-    let cols = Layout::horizontal([Constraint::Min(0), Constraint::Length(34)]).split(area);
     let n = app.store.projects.len();
 
     let mut spans = vec![Span::styled("  voido", Style::new().fg(accent()).bold())];
@@ -152,17 +152,33 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
             ));
         }
     }
-    let title = Line::from(spans);
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
 
+/// Weather glyph + temperature and the clock, as one line — shown centred in the
+/// footer.
+fn weather_clock_line(app: &App) -> Line<'static> {
     let now = Local::now();
     let date_text = if app.minimal {
-        format!("{}  ", now.format("%H:%M"))
+        now.format("%H:%M").to_string()
     } else {
-        format!("{}  ", now.format("%a %b %d · %H:%M"))
+        now.format("%a %b %d · %H:%M").to_string()
     };
-    let date = Line::from(Span::styled(date_text, Style::new().fg(subtle()))).right_aligned();
-    f.render_widget(Paragraph::new(title), cols[0]);
-    f.render_widget(Paragraph::new(date), cols[1]);
+    let mut spans: Vec<Span> = Vec::new();
+    if let Some(w) = &app.weather {
+        let deg = if app.minimal {
+            String::new()
+        } else {
+            w.deg().to_string()
+        };
+        spans.push(Span::styled(
+            format!("{} {}°{deg}", w.glyph(), w.temp_i()),
+            Style::new().fg(subtle()),
+        ));
+        spans.push(Span::styled("  ·  ", Style::new().fg(border())));
+    }
+    spans.push(Span::styled(date_text, Style::new().fg(subtle())));
+    Line::from(spans).centered()
 }
 
 fn render_projects(f: &mut Frame, area: Rect, app: &App) {
@@ -471,6 +487,33 @@ fn render_overview(f: &mut Frame, area: Rect, app: &App) {
             label("Next"),
             Span::styled("no upcoming milestones", Style::new().fg(subtle())),
         ])),
+    }
+
+    if let Some(w) = &app.weather {
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            label("Weather"),
+            Span::styled(format!("{}  ", w.glyph()), Style::new().fg(accent())),
+            Span::styled(
+                format!("{}°{}  {}", w.temp_i(), w.deg(), w.label()),
+                Style::new().fg(text()),
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::raw("           "),
+            Span::styled(
+                format!(
+                    "feels {}°{} · wind {} {} · {} · {}  (^w)",
+                    w.current.feels_like.round() as i64,
+                    w.deg(),
+                    w.current.wind.round() as i64,
+                    w.unit.wind_label(),
+                    w.place,
+                    rel_time(w.at),
+                ),
+                Style::new().fg(subtle()),
+            ),
+        ]));
     }
 
     f.render_widget(
@@ -1168,6 +1211,7 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
         Mode::Normal
         | Mode::Help
         | Mode::GitHub
+        | Mode::Weather
         | Mode::Theme(_)
         | Mode::Attach(_)
         | Mode::Tags(_) => ("N", accent()),
@@ -1230,6 +1274,13 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 
+    // Weather + clock, centred in the footer (skipped when it would collide with
+    // the pills on a narrow terminal).
+    let mid = weather_clock_line(app);
+    if area.width >= 56 {
+        f.render_widget(Paragraph::new(mid), area);
+    }
+
     // Right-aligned breadcrumb, only when there's comfortable room for it.
     let breadcrumb = if app.minimal {
         String::new()
@@ -1237,7 +1288,8 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
         build_breadcrumb(app)
     };
     let bc_width = breadcrumb.chars().count() as u16;
-    if !breadcrumb.is_empty() && area.width > bc_width + 40 {
+    // Needs room on the right half without crowding the centred weather/clock.
+    if !breadcrumb.is_empty() && area.width > bc_width.saturating_mul(2) + 34 {
         let r = Rect {
             x: area.x + area.width - bc_width - 1,
             y: area.y,
@@ -1355,6 +1407,99 @@ fn render_notice(f: &mut Frame, area: Rect, title: &str, body: &str) {
     );
 }
 
+fn render_weather(f: &mut Frame, area: Rect, app: &App) {
+    let Some(w) = &app.weather else {
+        return;
+    };
+    let u = w.deg();
+    let c = &w.current;
+    let sub = |s: String| Line::from(Span::styled(s, Style::new().fg(subtle())));
+
+    let mut lines: Vec<Line> = vec![
+        Line::from(vec![
+            Span::styled(
+                format!("  {}  ", w.glyph()),
+                Style::new().fg(accent()).bold(),
+            ),
+            Span::styled(format!("{}°{u}", w.temp_i()), Style::new().fg(text()).bold()),
+            Span::styled(format!("   {}", w.label()), Style::new().fg(text())),
+        ]),
+        sub(format!(
+            "  feels {}°{u}  ·  humidity {}%  ·  cloud {}%",
+            c.feels_like.round() as i64,
+            c.humidity,
+            c.cloud_cover
+        )),
+        sub(format!(
+            "  wind {} {} {}  ·  gusts {} {}",
+            c.wind.round() as i64,
+            w.unit.wind_label(),
+            w.wind_compass(),
+            c.wind_gust.round() as i64,
+            w.unit.wind_label()
+        )),
+        sub(format!(
+            "  pressure {} hPa  ·  precip {:.1} {}",
+            c.pressure.round() as i64,
+            c.precip,
+            w.unit.precip_label()
+        )),
+        Line::from(""),
+    ];
+
+    for (i, d) in w.days.iter().enumerate() {
+        let name = if i == 0 {
+            "Today".to_string()
+        } else {
+            d.date.format("%a").to_string()
+        };
+        let mut parts = vec![
+            Span::styled(format!("  {name:<7}"), Style::new().fg(text()).bold()),
+            Span::styled(format!("{} ", d.glyph()), Style::new().fg(accent())),
+            Span::styled(
+                format!("{}° / {}°", d.t_max.round() as i64, d.t_min.round() as i64),
+                Style::new().fg(text()),
+            ),
+        ];
+        let mut extra = String::new();
+        if i == 0 && !d.sunrise.is_empty() {
+            extra.push_str(&format!("   rise {} · set {}", d.sunrise, d.sunset));
+        }
+        if let Some(uv) = d.uv_max {
+            extra.push_str(&format!("   UV {}", uv.round() as i64));
+        }
+        if let Some(p) = d.precip_prob {
+            extra.push_str(&format!("   rain {p}%"));
+        }
+        if !extra.is_empty() {
+            parts.push(Span::styled(extra, Style::new().fg(subtle())));
+        }
+        lines.push(Line::from(parts));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(sub(format!("  updated {} · Open-Meteo", rel_time(w.at))));
+
+    let width = area.width.saturating_sub(8).clamp(40, 74);
+    let height = (lines.len() as u16 + 4).clamp(10, area.height.saturating_sub(2));
+    let rect = popup(area, width, height);
+    overlay(f, rect);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(accent()))
+        .title(Span::styled(
+            format!(" Weather · {} ", w.place),
+            Style::new().fg(accent()).bold(),
+        ))
+        .title(
+            Line::from(Span::styled(" any key closes ", Style::new().fg(subtle()))).right_aligned(),
+        )
+        .padding(Padding::new(2, 2, 1, 1));
+    f.render_widget(Paragraph::new(lines).block(block), rect);
+}
+
 fn render_confirm(f: &mut Frame, area: Rect, c: &ConfirmState) {
     let width = area.width.saturating_sub(8).clamp(24, 64);
     let rect = popup(area, width, 7);
@@ -1403,7 +1548,7 @@ fn render_help(f: &mut Frame, area: Rect) {
         ("?  q", "help · quit  (^c)"),
         ("^t  ^e", "theme · edit settings"),
         ("^s  ^g", "save to GitHub · link repo"),
-        ("^l", "activity panel (logs · changes)"),
+        ("^l  ^w", "activity panel · weather"),
     ];
     const COL2: &[Row] = &[
         ("", "PROJECTS"),

@@ -51,6 +51,14 @@ pub struct Config {
     /// Pick one live with `^t`.
     #[serde(default)]
     pub theme: Option<String>,
+    /// Weather location for the header / Overview line: a place name
+    /// (`"Lisbon"`), a `"lat,lon"` pair, or `"auto"` (IP-based). Empty / unset
+    /// disables it — no network call is made.
+    #[serde(default)]
+    pub weather: Option<String>,
+    /// Temperature unit for `weather`: `"c"` (default) or `"f"`.
+    #[serde(default)]
+    pub weather_unit: Option<String>,
     /// Custom themes, added to the `^t` picker. See [`crate::theme::ThemeSpec`].
     #[serde(default)]
     pub themes: Vec<crate::theme::ThemeSpec>,
@@ -160,6 +168,8 @@ const SETTINGS_HEADER: &str = "\
 #   github_token  Personal access token. Usually omit this — voido falls back to
 #                 `gh auth token` and then $GITHUB_TOKEN.
 #   theme         Colour theme slug, e.g. \"dracula\". Unknown -> default.
+#   weather       Place name, \"lat,lon\", or \"auto\" (IP-based). Empty = off.
+#   weather_unit  \"c\" (default) or \"f\".
 #
 # ^s fills in `storage` and `github_repo` for you.
 #

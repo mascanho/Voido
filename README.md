@@ -52,6 +52,9 @@ github_file = "notes.json"
 | `github_repo` | – | `owner/repo`, or a bare name (owner = the token's account) |
 | `github_file` | `voido-data.json` | name of the data file inside the repo; subpaths like `data/notes.json` work |
 | `github_token` | – | omit it to use `gh` / `$GITHUB_TOKEN` |
+| `weather` | – | place name (`"Lisbon"`), `"lat,lon"`, or `"auto"` (IP-based). Empty = off, no network call |
+| `weather_unit` | `"c"` | `"c"` or `"f"` |
+| `theme` | – | colour theme slug; pick live with `^t` |
 
 `^s` writes `storage` and `github_repo` for you; set `github_file` yourself if you
 want the synced file called something else. Changing it just starts a fresh file
@@ -93,6 +96,17 @@ All slots take `#rrggbb`. `on_accent` (text on a colour fill) is optional and
 defaults to `bg`. The name is slugified for the `theme` key (`My Neon` →
 `my-neon`); reuse a built-in's slug to override it. A theme that fails to parse
 is skipped with a message on startup.
+
+### Weather
+
+Set `weather` in the settings file to a place name, a `lat,lon` pair, or `auto`
+(IP-based) and voido shows current conditions — a compact glyph + temperature in
+the header, a fuller line on the Overview tab, and **`^w`** for the full modal
+(feels-like, humidity, wind + gusts + direction, pressure, cloud cover, plus a
+3-day outlook with highs/lows, sunrise/sunset, UV and rain chance). Data is from
+[Open-Meteo](https://open-meteo.com) (no API key); fetched on a background thread
+at startup and refreshed every 30 minutes. Fetch errors go to the `^l` Logs panel
+and are otherwise silent. Leave `weather` unset for no network call at all.
 
 ### GitHub activity
 
@@ -165,7 +179,7 @@ time for the full list.
 
 | Scope | Keys |
 | --- | --- |
-| Global | `h`/`l` switch pane · `w`/`s` prev/next project · `tab`/`S-tab` switch view · `1`‑`4` jump to a view · `gg`/`G` top/bottom · `esc` back out · `/` fuzzy find · `m` minimal view · `^l` activity panel · `^t` theme · `^s` save to GitHub · `^e` edit settings file · `?` help · `q` quit |
+| Global | `h`/`l` switch pane · `w`/`s` prev/next project · `tab`/`S-tab` switch view · `1`‑`4` jump to a view · `gg`/`G` top/bottom · `esc` back out · `/` fuzzy find · `m` minimal view · `^l` activity panel · `^w` weather · `^t` theme · `^s` save to GitHub · `^e` edit settings file · `?` help · `q` quit |
 | Projects | `a` add · `r` rename · `d` delete · `l` open · `i` detail · `t` tags · `^g` link/unlink code repo · `o` repo activity |
 | Overview | `e` edit description · `r` rename · `t` tags |
 | Todos | `a` add · `e` edit · `d` delete · `x` (or space) done · `p` priority · `o` sort by priority (cycles High/Med/Low on top) · `J`/`K` reorder · `l` subtasks · `i` detail · `n` view note · `N` edit note · `t` tags · `A` attachments |

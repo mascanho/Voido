@@ -3,6 +3,7 @@
 use std::cell::RefCell;
 use std::hash::{Hash, Hasher};
 use std::sync::mpsc::{self, Receiver};
+use std::time::Instant;
 
 use chrono::{DateTime, Local, NaiveDate};
 use ratatui::crossterm::event::{
@@ -277,6 +278,8 @@ pub enum Mode {
     EditBody(Box<EditState>),
     Help,
     GitHub,
+    /// Full current-conditions + 3-day forecast popup (`^w`).
+    Weather,
     Theme(ThemeState),
     /// A dismissible message popup — (title, body). Used for sync results.
     Notice(String, String),
@@ -359,6 +362,13 @@ pub struct App {
     /// Repo name captured from the first `^s` prompt, pending a token step.
     pending_sync_repo: Option<String>,
     sync_rx: Option<Receiver<Result<SyncOk, String>>>,
+    /// Current-conditions snapshot for the header / Overview, when `weather` is
+    /// configured. `None` until the first fetch lands.
+    pub weather: Option<crate::weather::Weather>,
+    weather_rx: Option<Receiver<Result<crate::weather::Weather, String>>>,
+    weather_in_flight: bool,
+    /// When the last weather fetch was *started* (drives the refresh interval).
+    weather_last_try: Option<Instant>,
     /// Memoized Markdown render of the note body currently on screen,
     /// keyed by (content hash, pane width).
     md_cache: RefCell<Option<(u64, u16, Vec<Line<'static>>)>>,
@@ -438,6 +448,10 @@ impl App {
             last_sync: None,
             pending_sync_repo: None,
             sync_rx: None,
+            weather: None,
+            weather_rx: None,
+            weather_in_flight: false,
+            weather_last_try: None,
             md_cache: RefCell::new(None),
             pane_rects: RefCell::new(PaneRects::default()),
         }
@@ -584,7 +598,67 @@ impl App {
             }
         }
 
+        if let Some(rx) = &self.weather_rx {
+            match rx.try_recv() {
+                Ok(result) => {
+                    self.weather_rx = None;
+                    self.weather_in_flight = false;
+                    match result {
+                        Ok(w) => {
+                            self.push_log(format!(
+                                "weather · {} · {} {}°{}",
+                                w.place,
+                                w.label(),
+                                w.temp_i(),
+                                w.deg()
+                            ));
+                            self.weather = Some(w);
+                        }
+                        Err(e) => self.push_log(format!("weather fetch failed: {e}")),
+                    }
+                    changed = true;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.weather_rx = None;
+                    self.weather_in_flight = false;
+                }
+            }
+        }
+
         changed
+    }
+
+    /// Kick off a weather fetch on a worker thread when `weather` is configured
+    /// and the last attempt is stale (or there hasn't been one). Cheap to call
+    /// every event-loop pass.
+    pub fn maybe_refresh_weather(&mut self) {
+        let Some(loc) = self
+            .config
+            .weather
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+        else {
+            return;
+        };
+        if self.weather_in_flight {
+            return;
+        }
+        let due = self
+            .weather_last_try
+            .is_none_or(|t| t.elapsed() >= crate::weather::REFRESH);
+        if !due {
+            return;
+        }
+
+        let unit = crate::weather::Unit::parse(self.config.weather_unit.as_deref());
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::weather::fetch(&loc, unit));
+        });
+        self.weather_rx = Some(rx);
+        self.weather_in_flight = true;
+        self.weather_last_try = Some(Instant::now());
     }
 
     /// `^s`: push now if sync is ready, otherwise start setup. When a token is
@@ -932,7 +1006,9 @@ impl App {
             Mode::Attach(_) => self.handle_attach(key),
             Mode::Tags(_) => self.handle_tags(key),
             Mode::Search(_) => self.handle_search(key),
-            Mode::Help | Mode::GitHub | Mode::Notice(..) => self.mode = Mode::Normal,
+            Mode::Help | Mode::GitHub | Mode::Weather | Mode::Notice(..) => {
+                self.mode = Mode::Normal
+            }
         }
     }
 
@@ -1048,6 +1124,20 @@ impl App {
                 KeyCode::Char('s') => self.sync_action(),
                 KeyCode::Char('e') => self.open_settings = true,
                 KeyCode::Char('t') => self.open_theme(),
+                KeyCode::Char('w') => {
+                    if self.weather.is_some() {
+                        self.mode = Mode::Weather;
+                    } else if self
+                        .config
+                        .weather
+                        .as_deref()
+                        .is_some_and(|s| !s.trim().is_empty())
+                    {
+                        self.status = "weather — still loading…".into();
+                    } else {
+                        self.status = "set `weather` in config (^e) to enable it".into();
+                    }
+                }
                 KeyCode::Char('l') => {
                     self.activity_open = !self.activity_open;
                     self.status = if self.activity_open {

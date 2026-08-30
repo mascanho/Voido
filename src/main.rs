@@ -10,6 +10,7 @@ mod storage_sqlite;
 mod theme;
 mod ui;
 mod util;
+mod weather;
 
 use std::error::Error;
 use std::io::Write;
@@ -306,7 +307,8 @@ fn run(
             redraw = true;
         }
 
-        // Pick up results from background work (GitHub fetches, data syncs).
+        // Kick off / pick up background work (GitHub fetches, data syncs, weather).
+        app.maybe_refresh_weather();
         if app.poll_background() {
             redraw = true;
         }

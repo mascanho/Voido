@@ -74,6 +74,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // Pull the latest from GitHub before the UI opens, when sync is set up.
     let mut sync_sha = None;
+    let mut startup_log: Vec<String> = vec![format!("voido {}", env!("CARGO_PKG_VERSION"))];
     if config.sync_configured() {
         if let Some(token) = token.as_deref() {
             eprint!("voido: syncing with GitHub… ");
@@ -83,25 +84,37 @@ fn main() -> Result<(), Box<dyn Error>> {
                     store = remote;
                     if let Err(e) = db.save(&store) {
                         eprintln!("(local save failed: {e})");
+                        startup_log.push(format!("startup pull: local save failed ({e})"));
                     } else {
                         eprintln!("pulled latest.");
+                        startup_log.push("pulled latest from GitHub".into());
                     }
                     sync_sha = Some(sha);
                 }
-                Ok(None) => eprintln!("no data in the repo yet — it will be created on exit."),
-                Err(e) => eprintln!("pull failed ({e}) — starting from local data."),
+                Ok(None) => {
+                    eprintln!("no data in the repo yet — it will be created on exit.");
+                    startup_log.push("GitHub repo empty — will be created on exit".into());
+                }
+                Err(e) => {
+                    eprintln!("pull failed ({e}) — starting from local data.");
+                    startup_log.push(format!("startup pull failed: {e}"));
+                }
             }
         } else {
             eprintln!(
                 "voido: GitHub sync is on but no token was found — run `gh auth login`, set \
-                 GITHUB_TOKEN, or press ^y in the app."
+                 GITHUB_TOKEN, or press ^s in the app."
             );
+            startup_log.push("GitHub sync on but no token found".into());
         }
     }
 
     let mut terminal = ratatui::init();
     let _ = execute!(std::io::stdout(), EnableMouseCapture);
     let mut app = App::new(store, config, sync_sha, token);
+    for line in startup_log {
+        app.push_log(line);
+    }
     let result = run(&mut terminal, &mut app, &db);
     let _ = execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
@@ -138,7 +151,7 @@ fn ensure_config() -> Result<Config, Box<dyn Error>> {
     }
 
     // First run: start local. GitHub sync is a one-keystroke opt-in from inside
-    // the app (`^y`), which auto-detects a `gh` login and creates the repo.
+    // the app (`^s`), which auto-detects a `gh` login and creates the repo.
     println!();
     println!("  Welcome to voido — your data lives locally at");
     println!("    {}", db_path().display());
@@ -146,7 +159,7 @@ fn ensure_config() -> Result<Config, Box<dyn Error>> {
     println!("  Settings (repo, data-file name, token) are in");
     println!("    {}", Config::path().display());
     println!();
-    println!("  To back it up to GitHub, press ^y in the app.");
+    println!("  To back it up to GitHub, press ^s in the app.");
     println!();
 
     let config = Config::default();
@@ -298,14 +311,19 @@ fn run(
             redraw = true;
         }
 
+        let mut saved = false;
         if app.dirty {
             if let Err(e) = db.save(&app.store) {
                 app.status = format!("save error: {e}");
             }
             app.dirty = false;
             app.note_unsynced_edit();
+            saved = true;
             redraw = true;
         }
+
+        // Fold this pass's status message into the ^l activity panel.
+        app.record_activity(saved);
 
         if redraw {
             app.clamp();

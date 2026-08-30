@@ -7,13 +7,14 @@ use ratatui::{
     style::{Modifier, Style, Stylize},
     text::{Line, Span},
     widgets::{
-        Block, BorderType, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap,
+        Block, BorderType, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Row, Table,
+        Wrap,
     },
 };
 
 use crate::app::{
-    App, AttachState, ConfirmState, DetailNote, EditTarget, Focus, InputState, Mode, PaneRects,
-    SearchState, SearchTarget, Tab, TagState, TagTarget, ThemeState, TlKind,
+    App, AttachState, ConfirmState, DetailNote, EditTarget, Focus, InputState, LogEntry, Mode,
+    PaneRects, SearchState, SearchTarget, Tab, TagState, TagTarget, ThemeState, TlKind,
 };
 use crate::model::{AttachmentKind, Priority};
 use crate::theme::{accent, bg, blue, border, green, on_accent, red, sel_bg, subtle, text, yellow};
@@ -34,11 +35,22 @@ pub fn render(f: &mut Frame, app: &App) {
 
     let mut rects = PaneRects::default();
 
+    // The `^l` activity panel eats a strip off the bottom of the body.
+    let body_rect = if app.activity_open {
+        let h = (rows[1].height / 3).clamp(6, 16);
+        let split =
+            Layout::vertical([Constraint::Min(3), Constraint::Length(h)]).split(rows[1]);
+        render_activity(f, split[1], app);
+        split[0]
+    } else {
+        rows[1]
+    };
+
     if app.tab == Tab::Todos || app.tab == Tab::Notes {
         if app.tab == Tab::Notes && app.note_expanded && app.focus == Focus::Detail {
             // Full-width note mode — projects + note body (or its editor) only.
             let body = Layout::horizontal([Constraint::Percentage(30), Constraint::Percentage(70)])
-                .split(rows[1]);
+                .split(body_rect);
             rects.projects = body[0];
             rects.detail = body[1];
             render_projects(f, body[0], app);
@@ -53,7 +65,7 @@ pub fn render(f: &mut Frame, app: &App) {
                 Constraint::Percentage(30),
                 Constraint::Percentage(40),
             ])
-            .split(rows[1]);
+            .split(body_rect);
             rects.projects = body[0];
             rects.content = body[1];
             rects.detail = body[2];
@@ -83,7 +95,7 @@ pub fn render(f: &mut Frame, app: &App) {
         }
     } else {
         let body = Layout::horizontal([Constraint::Percentage(30), Constraint::Percentage(70)])
-            .split(rows[1]);
+            .split(body_rect);
         rects.projects = body[0];
         rects.content = body[1];
         render_projects(f, body[0], app);
@@ -669,7 +681,8 @@ fn render_todos(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_subtasks(f: &mut Frame, area: Rect, app: &App) {
-    let focused = app.focus == Focus::Detail;
+    // Focus can be on the list, or handed off to the note pane below it.
+    let focused = app.focus == Focus::Detail && !app.sub_note_focus;
 
     let Some(todo) = app.current_todo() else {
         let block = panel(" Subtasks ".to_string(), focused);
@@ -819,9 +832,9 @@ fn render_detail_note(f: &mut Frame, area: Rect, app: &App, which: DetailNote) {
             None => return,
         },
     };
-    // The todo note owns the whole pane; the subtask note glows only while the
-    // Subtasks pane has focus.
-    let lit = matches!(which, DetailNote::Todo) || app.focus == Focus::Detail;
+    // The todo note owns the whole pane; the subtask note glows only while
+    // focus has been stepped into it.
+    let lit = matches!(which, DetailNote::Todo) || app.sub_note_focus;
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -850,7 +863,12 @@ fn render_detail_note(f: &mut Frame, area: Rect, app: &App, which: DetailNote) {
         } else {
             (scroll as u32 * 100 / max_scroll as u32) as u16
         };
-        let tag = format!(" {pct}%  ^d/^u ");
+        let keys = if matches!(which, DetailNote::Subtask(_)) && app.sub_note_focus {
+            "j/k"
+        } else {
+            "^d/^u"
+        };
+        let tag = format!(" {pct}%  {keys} ");
         let w = tag.chars().count() as u16;
         if area.width > w + 2 {
             let r = Rect {
@@ -1093,23 +1111,52 @@ fn render_timeline(f: &mut Frame, area: Rect, app: &App) {
     f.render_stateful_widget(list, area, &mut state);
 }
 
-/// The most useful keys for wherever focus currently is.
-fn context_hints(app: &App) -> &'static str {
-    match (app.focus, app.tab) {
-        (Focus::Projects, _) => "a add · r rename · l open · i detail · t tags · / find · o github",
-        (Focus::Content, Tab::Overview) => "e description · r rename · t tags · / find",
-        (Focus::Content, Tab::Todos) => {
-            "a add · e edit · x done · p prio · o sort · i detail · N note · t tags · l subtasks"
-        }
-        (Focus::Content, Tab::Notes) => "a add · e title · x pin · J/K move · l open · / find · d del",
-        (Focus::Content, Tab::Schedule) => {
-            "a milestone · x done · r reschedule · f filter · l jump · d delete"
-        }
-        (Focus::Detail, Tab::Notes) => "j/k scroll · ^d/^u page · e edit · space expand · h back",
-        (Focus::Detail, _) => {
-            "a add · e edit · x done · p prio · i detail · N note · t tags · A files · h back"
-        }
+/// The `^l` panel: two side-by-side tables — app events on the left, the log of
+/// data changes on the right.
+fn render_activity(f: &mut Frame, area: Rect, app: &App) {
+    let cols =
+        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(area);
+    render_log_table(f, cols[0], "Logs", &app.logs);
+    render_log_table(f, cols[1], "Changes", &app.changes);
+}
+
+fn render_log_table(f: &mut Frame, area: Rect, title: &str, entries: &[LogEntry]) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(border()))
+        .title(Span::styled(
+            format!(" {title} "),
+            Style::new().fg(subtle()).bold(),
+        ))
+        .title(
+            Line::from(Span::styled(
+                format!(" {} ", entries.len()),
+                Style::new().fg(subtle()),
+            ))
+            .right_aligned(),
+        );
+
+    if entries.is_empty() {
+        f.render_widget(hint("nothing yet").block(block), area);
+        return;
     }
+
+    // Show the tail that fits — newest at the bottom, like a console.
+    let visible = area.height.saturating_sub(2) as usize;
+    let start = entries.len().saturating_sub(visible);
+    let rows = entries[start..].iter().map(|e| {
+        Row::new(vec![
+            Line::from(Span::styled(
+                e.at.format("%H:%M:%S").to_string(),
+                Style::new().fg(subtle()),
+            )),
+            Line::from(Span::styled(e.text.clone(), Style::new().fg(text()))),
+        ])
+    });
+    let table =
+        Table::new(rows, [Constraint::Length(8), Constraint::Min(0)]).block(block);
+    f.render_widget(table, area);
 }
 
 fn render_footer(f: &mut Frame, area: Rect, app: &App) {
@@ -1135,6 +1182,7 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
         },
         Focus::Detail => match app.tab {
             Tab::Notes => "NOTE",
+            _ if app.sub_note_focus => "SUB·NOTE",
             _ => "SUBTASKS",
         },
     };
@@ -1173,50 +1221,12 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
             ));
         }
     }
-    spans.push(Span::raw("  "));
-    match &app.mode {
-        Mode::Input(_) => spans.push(Span::styled(
-            "enter  save    esc  cancel",
-            Style::new().fg(subtle()),
-        )),
-        Mode::Confirm(_) => spans.push(Span::styled(
-            "y  confirm    n  cancel",
-            Style::new().fg(subtle()),
-        )),
-        Mode::EditBody(_) => spans.push(Span::styled(
-            "esc / ^s  save & close",
-            Style::new().fg(subtle()),
-        )),
-        Mode::Theme(_) => spans.push(Span::styled(
-            "j / k  preview    enter  apply    esc  cancel",
-            Style::new().fg(subtle()),
-        )),
-        Mode::Help | Mode::GitHub | Mode::Notice(..) => {
-            spans.push(Span::styled("any key  close", Style::new().fg(subtle())))
-        }
-        Mode::Attach(_) => spans.push(Span::styled(
-            "a add · o open · d delete · esc close",
-            Style::new().fg(subtle()),
-        )),
-        Mode::Tags(_) => spans.push(Span::styled(
-            "a add · d delete · esc close",
-            Style::new().fg(subtle()),
-        )),
-        Mode::Search(_) => spans.push(Span::styled(
-            "type to filter · ↑↓ move · enter open · esc cancel",
-            Style::new().fg(subtle()),
-        )),
-        Mode::Normal => {
-            if !app.status.is_empty() {
-                spans.push(Span::styled(
-                    format!("{}   ", app.status),
-                    Style::new().fg(accent()),
-                ));
-            }
-            if !app.minimal {
-                spans.push(Span::styled(context_hints(app), Style::new().fg(subtle())));
-            }
-        }
+    // Transient action feedback only — key hints live in the `?` overlay.
+    if matches!(app.mode, Mode::Normal) && !app.status.is_empty() {
+        spans.push(Span::styled(
+            format!("  {}", app.status),
+            Style::new().fg(accent()),
+        ));
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 
@@ -1269,6 +1279,13 @@ fn build_breadcrumb(app: &App) -> String {
                 parts.push("todos".into());
                 if let Some(t) = app.current_todo() {
                     parts.push(truncate(&t.title, 20));
+                }
+                if app.sub_note_focus
+                    && let Some(s) = app
+                        .current_todo()
+                        .and_then(|t| t.subtasks.get(app.subtask_idx))
+                {
+                    parts.push(format!("{} · note", truncate(&s.title, 16)));
                 }
             }
             Tab::Notes => {
@@ -1385,7 +1402,8 @@ fn render_help(f: &mut Frame, area: Rect) {
         ("", "SYSTEM"),
         ("?  q", "help · quit  (^c)"),
         ("^t  ^e", "theme · edit settings"),
-        ("^y  ^g", "GitHub sync · link repo"),
+        ("^s  ^g", "save to GitHub · link repo"),
+        ("^l", "activity panel (logs · changes)"),
     ];
     const COL2: &[Row] = &[
         ("", "PROJECTS"),
@@ -1410,10 +1428,11 @@ fn render_help(f: &mut Frame, area: Rect) {
         ("", "TODOS · SUBTASKS"),
         ("a e d", "add · edit · delete"),
         ("x  space", "toggle done"),
-        ("p  o", "priority · sort"),
+        ("p  o", "cycle priority · sort by it"),
         ("l", "open subtasks"),
         ("i", "detail panel"),
         ("n  N", "view · edit note"),
+        ("l / h", "focus note to scroll · back"),
         ("t  A", "tags · attachments"),
         ("", ""),
         ("", "NOTES"),

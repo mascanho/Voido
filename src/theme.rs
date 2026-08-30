@@ -4,20 +4,24 @@
 //!
 //! Extra themes can be added straight in the settings file:
 //!
-//! ```json
-//! "themes": [
-//!   {
-//!     "name": "My Theme",
-//!     "accent": "#ff8800", "green": "#a6e3a1", "red": "#f38ba8",
-//!     "yellow": "#f9e2af", "blue": "#89b4fa", "text": "#cdd6f4",
-//!     "subtle": "#7f849c", "border": "#45475a", "sel_bg": "#313244",
-//!     "bg": "#1e1e2e", "on_accent": "#1e1e2e"
-//!   }
-//! ]
+//! ```toml
+//! [[themes]]
+//! name = "My Theme"
+//! accent = "#ff8800"
+//! green  = "#a6e3a1"
+//! red    = "#f38ba8"
+//! yellow = "#f9e2af"
+//! blue   = "#89b4fa"
+//! text   = "#cdd6f4"
+//! subtle = "#7f849c"
+//! border = "#45475a"
+//! sel_bg = "#313244"
+//! bg     = "#1e1e2e"
+//! on_accent = "#1e1e2e"
 //! ```
 //!
 //! `on_accent` (text drawn on a colour fill) defaults to `bg`; every other slot
-//! is required. The name is slugified for the `"theme"` key (`"My Theme"` →
+//! is required. The name is slugified for the `theme` key (`"My Theme"` →
 //! `"my-theme"`); a custom theme whose slug matches a built-in replaces it.
 
 use std::cell::Cell;
@@ -459,7 +463,7 @@ fn builtin_entries() -> Vec<ThemeEntry> {
 
 // ---- custom themes from the settings file --------------------------------
 
-/// A theme as written in `config.json` — hex strings, validated on load.
+/// A theme as written in `config.toml` — hex strings, validated on load.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThemeSpec {
     pub name: String,

@@ -15,35 +15,35 @@ older version is imported automatically on first run.
 ### GitHub sync
 
 voido can keep a copy of your data in a GitHub repo — it pulls the latest on
-startup and pushes on exit (and on demand with `^y`).
+startup and pushes on exit (and on demand with `^s`).
 
 **If you have the [`gh` CLI](https://cli.github.com) set up** (`gh auth login`),
-it's zero config: press `^y`, hit Enter to accept `voido-data`, and voido
+it's zero config: press `^s`, hit Enter to accept `voido-data`, and voido
 creates the private repo and syncs. Same deal if `GITHUB_TOKEN` / `GH_TOKEN` is
 in your environment.
 
-**Otherwise** `^y` asks for a repo (`owner/repo` or just a name) and a token —
+**Otherwise** `^s` asks for a repo (`owner/repo` or just a name) and a token —
 classic PAT with **`repo`** scope, or fine-grained with **Contents: read and
 write**. voido creates the repo if it's under your account and doesn't exist yet.
 
-- Token precedence: the one you enter in `^y` → `gh auth token` → environment.
+- Token precedence: the one you enter in `^s` → `gh auth token` → environment.
   Only a token you type is written to config.
 - Conflicts are last-write-wins (whichever machine exits last).
 - A failed sync pops a dialog with GitHub's exact error.
 
 #### Settings file
 
-Hand-editable JSON at `~/Library/Application Support/voido/config.json` (macOS) /
-`~/.config/voido/config.json` (Linux). Every key is optional — omit one (or set
-it to `null`) for the default.
+Hand-editable TOML at `~/Library/Application Support/voido/config.toml` (macOS) /
+`~/.config/voido/config.toml` (Linux). Every key is optional — omit one for the
+default. The file is written with a comment block documenting every key, so `^e`
+is usually all the reference you need. An older `config.json` is converted to
+TOML automatically on first run (kept as `config.json.bak`).
 
-```json
-{
-  "storage": "github",
-  "github_repo": "me/my-notes",
-  "github_file": "notes.json",
-  "github_token": null
-}
+```toml
+storage = "github"
+github_repo = "me/my-notes"
+github_file = "notes.json"
+# github_token = "…"   # usually omitted
 ```
 
 | key | default | meaning |
@@ -51,9 +51,9 @@ it to `null`) for the default.
 | `storage` | `"local"` | `"local"` or `"github"` (turns sync on) |
 | `github_repo` | – | `owner/repo`, or a bare name (owner = the token's account) |
 | `github_file` | `voido-data.json` | name of the data file inside the repo; subpaths like `data/notes.json` work |
-| `github_token` | `null` | leave `null` to use `gh` / `$GITHUB_TOKEN` |
+| `github_token` | – | omit it to use `gh` / `$GITHUB_TOKEN` |
 
-`^y` writes `storage` and `github_repo` for you; set `github_file` yourself if you
+`^s` writes `storage` and `github_repo` for you; set `github_file` yourself if you
 want the synced file called something else. Changing it just starts a fresh file
 under the new name (the old one is left in the repo). If the file is malformed,
 voido refuses to start rather than overwrite your edits.
@@ -64,7 +64,7 @@ it's reloaded when you close the editor.
 ### Themes
 
 Press **`^t`** for the theme picker — `j`/`k` previews live, `enter` keeps it,
-`esc` reverts. The choice is saved as `"theme"` in the settings file, so you can
+`esc` reverts. The choice is saved as `theme` in the settings file, so you can
 also set it there directly. 25 are bundled: Catppuccin (Mocha / Macchiato /
 Frappé / Latte), Tokyo Night, Kanagawa, Dracula, Nord, Rosé Pine (+ Moon /
 Dawn), Gruvbox (Dark / Material / Light), Everforest (Dark / Light), One Dark,
@@ -74,20 +74,23 @@ Monokai, Ayu (Dark / Mirage), GitHub (Dark / Light), Zenburn, Solarized
 Add your own in the settings file — they show up in the picker alongside the
 built-ins:
 
-```json
-"themes": [
-  {
-    "name": "My Neon",
-    "accent": "#ff00ff", "green": "#00ff88", "red": "#ff3355",
-    "yellow": "#ffee00", "blue": "#22ddff", "text": "#e8e8ff",
-    "subtle": "#7a7a99", "border": "#333355", "sel_bg": "#222244",
-    "bg": "#0a0a14"
-  }
-]
+```toml
+[[themes]]
+name = "My Neon"
+accent = "#ff00ff"
+green  = "#00ff88"
+red    = "#ff3355"
+yellow = "#ffee00"
+blue   = "#22ddff"
+text   = "#e8e8ff"
+subtle = "#7a7a99"
+border = "#333355"
+sel_bg = "#222244"
+bg     = "#0a0a14"
 ```
 
 All slots take `#rrggbb`. `on_accent` (text on a colour fill) is optional and
-defaults to `bg`. The name is slugified for the `"theme"` key (`My Neon` →
+defaults to `bg`. The name is slugified for the `theme` key (`My Neon` →
 `my-neon`); reuse a built-in's slug to override it. A theme that fails to parse
 is skipped with a message on startup.
 
@@ -121,23 +124,32 @@ pane keeps its own `i` toggle, so expanding todos doesn't also expand the rail.
  │▍◈ Website  3/8 ││ ○ Design system in Figma        ↑  ⊞2/3    Sep 01││ ✔ Hero       │
  │ ◆ Voido      ✓ ││ ○ Rebuild the home page              ¶     Sep 09││ ○ Nav+footer │
  ╰────────────────╯╰──────────────────────────────────────────────╯╰──────────────╯
-  NORMAL  TODOS   <status>   context key hints          Website > todos
+  N  TODOS   <status>                                  Website > todos
 ```
 
 The middle pane's tabs live on its top border. Left rail is the project list;
 the right pane shows subtasks (Todos) or the note body (Notes).
 
+Press **`^l`** for the activity panel — a strip below the panes with two tables:
+**Logs** (app events: startup, sync, settings reloads, errors) and **Changes**
+(every data edit you've made this session, newest at the bottom). Session-only,
+not persisted. `^l` again hides it.
+
 - **Overview** — description, todo/subtask progress bar, note count, next milestone
 - **Todos** — checkbox, priority, due date, subtask progress; `l` opens the
   **Subtasks** pane on the right for the selected todo. `o` sorts the list by
-  priority. A todo that has subtasks is ticked automatically once they're all
+  priority — each press cycles which tier floats to the top (High → Medium → Low);
+  works the same way in the Subtasks pane. A todo that has subtasks is ticked
+  automatically once they're all
   done (and un-ticked if one reopens). Each todo **and subtask** can carry a
   Markdown **note** (`¶`) and a list of **attachments** — links, files or images
   (`A`, marked `📎`); `o` / `enter` in the manager hands the item to your system
   opener.
   - `N` edits a note; `n` shows the rendered note — a **todo's** note fills the
     Subtasks pane, a **subtask's** (`↳`) opens in a section below the subtask
-    list. `n` again hides it; `^d` / `^u` scroll it
+    list. `n` again hides it. A subtask note opens **focused** so `j`/`k` (and
+    `^d` / `^u`) scroll it; `l` re-enters it from the list, `h` / `esc` steps
+    back out to the subtasks
 - **Notes** — quick per-project notes; `x` pins one (★). `l` opens the note's
   **Markdown body** in the right pane, rendered properly (headings, nested
   lists, block quotes, fenced code, rules, `**bold**` / `*italic*` / `` `code` ``).
@@ -153,11 +165,11 @@ time for the full list.
 
 | Scope | Keys |
 | --- | --- |
-| Global | `h`/`l` switch pane · `w`/`s` prev/next project · `tab`/`S-tab` switch view · `1`‑`4` jump to a view · `gg`/`G` top/bottom · `esc` back out · `/` fuzzy find · `m` minimal view · `^t` theme · `^y` GitHub sync · `^e` edit settings file · `?` help · `q` quit |
+| Global | `h`/`l` switch pane · `w`/`s` prev/next project · `tab`/`S-tab` switch view · `1`‑`4` jump to a view · `gg`/`G` top/bottom · `esc` back out · `/` fuzzy find · `m` minimal view · `^l` activity panel · `^t` theme · `^s` save to GitHub · `^e` edit settings file · `?` help · `q` quit |
 | Projects | `a` add · `r` rename · `d` delete · `l` open · `i` detail · `t` tags · `^g` link/unlink code repo · `o` repo activity |
 | Overview | `e` edit description · `r` rename · `t` tags |
-| Todos | `a` add · `e` edit · `d` delete · `x` (or space) done · `p` priority · `o` sort by priority · `J`/`K` reorder · `l` subtasks · `i` detail · `n` view note · `N` edit note · `t` tags · `A` attachments |
-| Subtasks | `a` add · `e` edit · `d` delete · `x` done · `p` priority · `J`/`K` reorder · `i` detail · `n` view note · `N` edit note · `t` tags · `A` attachments · `h` back |
+| Todos | `a` add · `e` edit · `d` delete · `x` (or space) done · `p` priority · `o` sort by priority (cycles High/Med/Low on top) · `J`/`K` reorder · `l` subtasks · `i` detail · `n` view note · `N` edit note · `t` tags · `A` attachments |
+| Subtasks | `a` add · `e` edit · `d` delete · `x` done · `p` priority · `o` sort by priority (cycles High/Med/Low on top) · `J`/`K` reorder · `i` detail · `n` view note · `N` edit note · `l` focus note (then `j`/`k` scroll, `h` back) · `t` tags · `A` attachments · `h` back |
 | Tags (`t`) | `a` add one or more (space-separated) · `d` remove the selected tag · `esc` close |
 | Notes | `a` add · `e` edit title · `d` delete · `x` pin · `J`/`K` reorder · `l` open body |
 | Note body | `j`/`k` · `^d`/`^u` scroll · `space` expand · `e` edit · `h` back |

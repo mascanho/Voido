@@ -36,6 +36,13 @@ pub struct PaneRects {
     pub detail: Rect,
 }
 
+/// One line in the `^l` activity panel.
+#[derive(Debug, Clone)]
+pub struct LogEntry {
+    pub at: DateTime<Local>,
+    pub text: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     Overview,
@@ -296,6 +303,9 @@ pub struct App {
     /// list. Independent, each with its own `^d` / `^u` scroll offset.
     pub todo_note_open: bool,
     pub sub_note_open: bool,
+    /// While a subtask note is open, `l` steps focus into that pane so `j`/`k`
+    /// scroll it; `h` / `esc` steps back out to the subtask list.
+    pub sub_note_focus: bool,
     pub todo_note_scroll: u16,
     pub sub_note_scroll: u16,
     /// `i` toggles an inline detail panel (tags, dates, counts…) under the
@@ -306,8 +316,20 @@ pub struct App {
     pub subtask_info: bool,
     /// `m` toggles a stripped-back layout (no hint bar, minimal header).
     pub minimal: bool,
+    /// `^l` toggles a bottom panel with two tables: app events and the log of
+    /// data changes made this session.
+    pub activity_open: bool,
+    /// Session event log (status-line messages that weren't data changes).
+    pub logs: Vec<LogEntry>,
+    /// Session change log (status-line messages that accompanied a save).
+    pub changes: Vec<LogEntry>,
+    /// Last status text folded into `logs`/`changes`, so each message lands once.
+    last_activity_status: String,
     pub timeline_idx: usize,
     pub deadline_filter: DeadlineFilter,
+    /// Which priority the last `o` press floated to the top. `o` cycles it
+    /// High -> Medium -> Low -> High and re-sorts the list in focus.
+    pub prio_sort: Option<Priority>,
     pub mode: Mode,
     pub status: String,
     pub should_quit: bool,
@@ -334,7 +356,7 @@ pub struct App {
     pub sync_pending: usize,
     /// When the last successful sync completed this session.
     pub last_sync: Option<DateTime<Local>>,
-    /// Repo name captured from the first `^y` prompt, pending a token step.
+    /// Repo name captured from the first `^s` prompt, pending a token step.
     pending_sync_repo: Option<String>,
     sync_rx: Option<Receiver<Result<SyncOk, String>>>,
     /// Memoized Markdown render of the note body currently on screen,
@@ -383,6 +405,7 @@ impl App {
             note_scroll: 0,
             todo_note_open: false,
             sub_note_open: false,
+            sub_note_focus: false,
             todo_note_scroll: 0,
             sub_note_scroll: 0,
             note_expanded: false,
@@ -390,8 +413,13 @@ impl App {
             todo_info: false,
             subtask_info: false,
             minimal: false,
+            activity_open: false,
+            logs: Vec::new(),
+            changes: Vec::new(),
+            last_activity_status: String::new(),
             timeline_idx: 0,
             deadline_filter: DeadlineFilter::All,
+            prio_sort: None,
             mode: Mode::Normal,
             status: String::new(),
             should_quit: false,
@@ -436,11 +464,36 @@ impl App {
 
     /// Record that the local store diverged from what's on GitHub. Called once
     /// per edit cycle (after the local DB save), so the footer can show how many
-    /// edits are waiting for the next `^y` / exit push.
+    /// edits are waiting for the next `^s` / exit push.
     pub fn note_unsynced_edit(&mut self) {
         if self.sync_ready() {
             self.sync_pending = self.sync_pending.saturating_add(1);
         }
+    }
+
+    /// Fold this tick's status message into the `^l` activity panel. `saved` is
+    /// set when a data change was just persisted, which routes the line to the
+    /// **Changes** table instead of **Logs**. Call once per event-loop pass.
+    pub fn record_activity(&mut self, saved: bool) {
+        if saved {
+            // Exactly one persisted edit this tick — always its own row, even if
+            // the status text repeats a previous action.
+            let text = if self.status.is_empty() {
+                "edited".to_string()
+            } else {
+                self.status.clone()
+            };
+            push_capped(&mut self.changes, text);
+        } else if !self.status.is_empty() && self.status != self.last_activity_status {
+            push_capped(&mut self.logs, self.status.clone());
+        }
+        self.last_activity_status = self.status.clone();
+    }
+
+    /// Append a line to the **Logs** table directly (startup / shutdown events
+    /// that never touch the status line).
+    pub fn push_log(&mut self, text: impl Into<String>) {
+        push_capped(&mut self.logs, text.into());
     }
 
     /// Markdown-render a note body, reusing the last result when the content and
@@ -515,7 +568,7 @@ impl App {
                             let repo = self.config.github_repo.clone().unwrap_or_default();
                             self.mode = Mode::Notice(
                                 "GitHub sync failed".into(),
-                                format!("{repo}\n\n{e}\n\nPress ^y to re-run the setup."),
+                                format!("{repo}\n\n{e}\n\nPress ^s to re-run the setup."),
                             );
                         }
                     }
@@ -534,7 +587,7 @@ impl App {
         changed
     }
 
-    /// `^y`: push now if sync is ready, otherwise start setup. When a token is
+    /// `^s`: push now if sync is ready, otherwise start setup. When a token is
     /// already available (config / `gh` / env) the only prompt is the repo.
     fn sync_action(&mut self) {
         if self.sync_ready() {
@@ -579,7 +632,7 @@ impl App {
         }
         let (Some(repo), Some(token)) = (self.config.github_repo.clone(), self.sync_token.clone())
         else {
-            self.status = "GitHub sync is not configured — press ^y".into();
+            self.status = "GitHub sync is not configured — press ^s".into();
             return;
         };
         let json = match serde_json::to_string_pretty(&self.store) {
@@ -625,7 +678,11 @@ impl App {
         if let Some(t) = self.current_todo_mut()
             && t.recompute_done()
         {
+            let (title, done) = (t.title.clone(), t.done);
             self.dirty = true;
+            if done {
+                self.status = format!("“{title}” auto-completed");
+            }
         }
     }
 
@@ -677,6 +734,9 @@ impl App {
             Some(s) if !s.note.trim().is_empty() => {
                 self.sub_note_open = !self.sub_note_open;
                 self.sub_note_scroll = 0;
+                // Opening jumps straight into the note so it can be scrolled;
+                // closing drops the focus flag with it.
+                self.sub_note_focus = self.sub_note_open;
             }
             Some(_) => self.status = "no note yet — press N to write one".into(),
             None => {}
@@ -854,6 +914,10 @@ impl App {
         if self.focus == Focus::Detail && !self.detail_available() {
             self.focus = Focus::Content;
         }
+        // The subtask-note pane can't hold focus once it's no longer on screen.
+        if self.sub_note_focus && !self.showing_sub_note() {
+            self.sub_note_focus = false;
+        }
     }
 
     // ---- top level dispatch --------------------------------------------
@@ -884,11 +948,19 @@ impl App {
         match me.kind {
             MouseEventKind::Down(MouseButton::Left) => self.click_pane(pos),
             MouseEventKind::ScrollDown => {
-                self.move_sel(3);
+                if self.sub_note_focus && self.showing_sub_note() {
+                    self.scroll_detail_note(3);
+                } else {
+                    self.move_sel(3);
+                }
                 true
             }
             MouseEventKind::ScrollUp => {
-                self.move_sel(-3);
+                if self.sub_note_focus && self.showing_sub_note() {
+                    self.scroll_detail_note(-3);
+                } else {
+                    self.move_sel(-3);
+                }
                 true
             }
             _ => false,
@@ -973,9 +1045,17 @@ impl App {
             match key.code {
                 KeyCode::Char('c') => self.should_quit = true,
                 KeyCode::Char('g') => self.link_repo_prompt(),
-                KeyCode::Char('y') => self.sync_action(),
+                KeyCode::Char('s') => self.sync_action(),
                 KeyCode::Char('e') => self.open_settings = true,
                 KeyCode::Char('t') => self.open_theme(),
+                KeyCode::Char('l') => {
+                    self.activity_open = !self.activity_open;
+                    self.status = if self.activity_open {
+                        "activity panel — ^l to hide".into()
+                    } else {
+                        String::new()
+                    };
+                }
                 // page scroll in the note body
                 KeyCode::Char('d') if self.focus == Focus::Detail && self.tab == Tab::Notes => {
                     self.note_scroll = self.note_scroll.saturating_add(10);
@@ -1024,7 +1104,9 @@ impl App {
             KeyCode::Char('w') => self.select_project(-1),
             KeyCode::Char('s') => self.select_project(1),
             KeyCode::Esc => {
-                if self.tab == Tab::Notes && self.focus == Focus::Detail && self.note_expanded {
+                if self.sub_note_focus {
+                    self.sub_note_focus = false;
+                } else if self.tab == Tab::Notes && self.focus == Focus::Detail && self.note_expanded {
                     self.note_expanded = false;
                 } else {
                     self.focus = match self.focus {
@@ -1034,13 +1116,21 @@ impl App {
                 }
             }
             KeyCode::Char('g') => {
-                if g_pending {
+                if self.sub_note_focus {
+                    self.sub_note_scroll = 0;
+                } else if g_pending {
                     self.move_sel(-1_000_000);
                 } else {
                     self.pending_g = true;
                 }
             }
-            KeyCode::Char('G') => self.move_sel(1_000_000),
+            KeyCode::Char('G') => {
+                if self.sub_note_focus {
+                    self.scroll_detail_note(30_000);
+                } else {
+                    self.move_sel(1_000_000);
+                }
+            }
             _ => match self.focus {
                 Focus::Projects => self.handle_projects_key(key),
                 Focus::Content => match self.tab {
@@ -1049,6 +1139,9 @@ impl App {
                     Tab::Notes => self.handle_notes_key(key),
                     Tab::Schedule => self.handle_timeline_key(key),
                 },
+                Focus::Detail if self.sub_note_focus && self.showing_sub_note() => {
+                    self.handle_sub_note_key(key)
+                }
                 Focus::Detail => match self.tab {
                     Tab::Notes => self.handle_note_body_key(key),
                     _ => self.handle_subtasks_key(key),
@@ -1139,14 +1232,18 @@ impl App {
                     for s in &mut t.subtasks {
                         s.done = t.done;
                     }
+                    let (title, done) = (t.title.clone(), t.done);
                     self.dirty = true;
+                    self.status = format!("{} “{title}”", if done { "done" } else { "reopened" });
                 }
             }
             KeyCode::Char('p') => {
                 let i = self.todo_idx;
                 if let Some(t) = self.current_project_mut().and_then(|p| p.todos.get_mut(i)) {
                     t.priority = t.priority.next();
+                    let (title, prio) = (t.title.clone(), t.priority.label());
                     self.dirty = true;
+                    self.status = format!("“{title}” priority: {prio}");
                 }
             }
             KeyCode::Char('d') => {
@@ -1173,15 +1270,29 @@ impl App {
         }
     }
 
-    /// Stable-sort the current project's todos, highest priority first. Keeps the
-    /// selection on the same todo.
+    /// Advance the priority-sort cycle (High -> Medium -> Low -> High) and return
+    /// the priority that should now sit on top.
+    fn next_prio_sort(&mut self) -> Priority {
+        let next = match self.prio_sort {
+            None | Some(Priority::Low) => Priority::High,
+            Some(Priority::High) => Priority::Medium,
+            Some(Priority::Medium) => Priority::Low,
+        };
+        self.prio_sort = Some(next);
+        next
+    }
+
+    /// `o` in the Todos pane: stable-sort the current project's todos so `top`
+    /// sits first, the rest following in High -> Low order. Repeated presses
+    /// cycle which priority floats up. Keeps the selection on the same todo.
     fn sort_todos_by_priority(&mut self) {
+        let top = self.next_prio_sort();
         let selected_title = self.current_todo().map(|t| t.title.clone());
         if let Some(p) = self.current_project_mut() {
             if p.todos.len() < 2 {
                 return;
             }
-            p.todos.sort_by_key(|t| t.priority.rank());
+            p.todos.sort_by_key(|t| priority_sort_key(t.priority, top));
             self.dirty = true;
         }
         if let (Some(title), Some(p)) = (selected_title, self.current_project())
@@ -1190,7 +1301,31 @@ impl App {
             self.todo_idx = i;
         }
         self.subtask_idx = 0;
-        self.status = "sorted by priority".into();
+        self.status = format!("{} priority on top", top.label());
+    }
+
+    /// `o` in the Subtasks pane: same cycle, applied to the current todo's
+    /// subtasks. Keeps the selection on the same subtask.
+    fn sort_subtasks_by_priority(&mut self) {
+        let top = self.next_prio_sort();
+        let selected_title = self
+            .current_todo()
+            .and_then(|t| t.subtasks.get(self.subtask_idx))
+            .map(|s| s.title.clone());
+        if let Some(t) = self.current_todo_mut() {
+            if t.subtasks.len() < 2 {
+                return;
+            }
+            t.subtasks
+                .sort_by_key(|s| priority_sort_key(s.priority, top));
+            self.dirty = true;
+        }
+        if let (Some(title), Some(t)) = (selected_title, self.current_todo())
+            && let Some(i) = t.subtasks.iter().position(|s| s.title == title)
+        {
+            self.subtask_idx = i;
+        }
+        self.status = format!("{} priority on top", top.label());
     }
 
     fn reorder_todo(&mut self, delta: i32) {
@@ -1208,6 +1343,7 @@ impl App {
         }
         self.todo_idx = j;
         self.dirty = true;
+        self.status = "moved todo".into();
     }
 
     // ---- subtasks pane ------------------------------------------
@@ -1217,6 +1353,13 @@ impl App {
             KeyCode::Char('j') | KeyCode::Down => self.move_sel(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_sel(-1),
             KeyCode::Char('h') | KeyCode::Left => self.focus = Focus::Content,
+            KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => {
+                if self.showing_sub_note() {
+                    self.sub_note_focus = true;
+                } else {
+                    self.toggle_sub_note();
+                }
+            }
             KeyCode::Char('n') => self.toggle_sub_note(),
             KeyCode::Char('a') => {
                 if self.current_todo().is_some() {
@@ -1241,7 +1384,10 @@ impl App {
                 let i = self.subtask_idx;
                 if let Some(s) = self.current_todo_mut().and_then(|t| t.subtasks.get_mut(i)) {
                     s.done = !s.done;
+                    let (title, done) = (s.title.clone(), s.done);
                     self.dirty = true;
+                    self.status =
+                        format!("subtask {} “{title}”", if done { "done" } else { "reopened" });
                 }
                 self.sync_parent_done();
             }
@@ -1249,7 +1395,9 @@ impl App {
                 let i = self.subtask_idx;
                 if let Some(s) = self.current_todo_mut().and_then(|t| t.subtasks.get_mut(i)) {
                     s.priority = s.priority.next();
+                    let (title, prio) = (s.title.clone(), s.priority.label());
                     self.dirty = true;
+                    self.status = format!("subtask “{title}” priority: {prio}");
                 }
             }
             KeyCode::Char('d') => {
@@ -1267,10 +1415,29 @@ impl App {
             }
             KeyCode::Char('J') => self.reorder_subtask(1),
             KeyCode::Char('K') => self.reorder_subtask(-1),
+            KeyCode::Char('o') => self.sort_subtasks_by_priority(),
             KeyCode::Char('N') => self.begin_edit_subtask_note(),
             KeyCode::Char('A') => self.open_subtask_attachments(),
             KeyCode::Char('t') => self.open_tags(),
             KeyCode::Char('i') => self.subtask_info = !self.subtask_info,
+            _ => {}
+        }
+    }
+
+    /// Keys while focus sits in the subtask-note pane (opened with `n` / `l`):
+    /// scroll the note, edit it, or step back out to the subtask list.
+    fn handle_sub_note_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => self.scroll_detail_note(1),
+            KeyCode::Char('k') | KeyCode::Up => self.scroll_detail_note(-1),
+            KeyCode::PageDown => self.scroll_detail_note(10),
+            KeyCode::PageUp => self.scroll_detail_note(-10),
+            KeyCode::Char('N') | KeyCode::Char('e') => self.begin_edit_subtask_note(),
+            KeyCode::Char('h') | KeyCode::Left => self.sub_note_focus = false,
+            KeyCode::Char('n') => {
+                self.sub_note_open = false;
+                self.sub_note_focus = false;
+            }
             _ => {}
         }
     }
@@ -1290,6 +1457,7 @@ impl App {
         }
         self.subtask_idx = j;
         self.dirty = true;
+        self.status = "moved subtask".into();
     }
 
     // ---- overview tab -------------------------------------------
@@ -1348,7 +1516,9 @@ impl App {
                 let i = self.note_idx;
                 if let Some(n) = self.current_project_mut().and_then(|p| p.notes.get_mut(i)) {
                     n.pinned = !n.pinned;
+                    let pinned = n.pinned;
                     self.dirty = true;
+                    self.status = if pinned { "note pinned" } else { "note unpinned" }.into();
                 }
             }
             KeyCode::Char('d') => {
@@ -1385,6 +1555,7 @@ impl App {
         }
         self.note_idx = j;
         self.dirty = true;
+        self.status = "moved note".into();
     }
 
     // ---- note body pane (rendered markdown, beside a note) ------
@@ -2447,6 +2618,7 @@ impl App {
         self.note_scroll = 0;
         self.todo_note_open = false;
         self.sub_note_open = false;
+        self.sub_note_focus = false;
         self.todo_note_scroll = 0;
         self.sub_note_scroll = 0;
         self.timeline_idx = 0;
@@ -2632,6 +2804,25 @@ fn fuzzy_score(needle: &str, haystack: &str) -> Option<i32> {
     }
     score -= haystack.chars().count() as i32 / 20;
     Some(score)
+}
+
+/// Sort key that floats `top` to the front, with the other two priorities
+/// following in High -> Medium -> Low order. `slice::sort_by_key` is stable, so
+/// items of equal priority keep their relative order.
+fn priority_sort_key(p: Priority, top: Priority) -> u8 {
+    if p == top { 0 } else { p.rank() + 1 }
+}
+
+/// Append an activity line, trimming the oldest once the buffer is full.
+fn push_capped(buf: &mut Vec<LogEntry>, text: String) {
+    const CAP: usize = 400;
+    buf.push(LogEntry {
+        at: Local::now(),
+        text,
+    });
+    if buf.len() > CAP {
+        buf.remove(0);
+    }
 }
 
 fn step(idx: usize, delta: i32, len: usize) -> usize {
@@ -2956,6 +3147,24 @@ mod tests {
         assert_eq!(prio, Priority::High);
         assert_eq!(due, t.due);
         assert_eq!(tags, t.tags);
+    }
+
+    #[test]
+    fn priority_sort_key_floats_chosen_priority() {
+        let mut v = [Priority::Low, Priority::High, Priority::Medium, Priority::Low];
+        v.sort_by_key(|p| priority_sort_key(*p, Priority::High));
+        assert_eq!(
+            v,
+            [Priority::High, Priority::Medium, Priority::Low, Priority::Low]
+        );
+
+        let mut v = [Priority::Low, Priority::High, Priority::Medium];
+        v.sort_by_key(|p| priority_sort_key(*p, Priority::Medium));
+        assert_eq!(v, [Priority::Medium, Priority::High, Priority::Low]);
+
+        let mut v = [Priority::High, Priority::Medium, Priority::Low];
+        v.sort_by_key(|p| priority_sort_key(*p, Priority::Low));
+        assert_eq!(v, [Priority::Low, Priority::High, Priority::Medium]);
     }
 
     #[test]

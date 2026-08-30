@@ -1,10 +1,10 @@
 //! SQLite storage backend for voido.
 
-use crate::model::{Milestone, Note, Priority, Project, Store, Subtask, Todo};
+use crate::model::{Attachment, Milestone, Note, Priority, Project, Store, Subtask, Todo};
 use rusqlite::{Connection, params};
 
 /// Bump when the schema changes and add a matching arm in `migrate`.
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 5;
 
 pub struct SqliteStorage {
     conn: Connection,
@@ -37,7 +37,17 @@ impl SqliteStorage {
                 done INTEGER DEFAULT 0,
                 priority TEXT DEFAULT 'medium',
                 due TEXT DEFAULT NULL,
+                note TEXT NOT NULL DEFAULT '',
                 FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS attachments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                todo_id INTEGER NOT NULL,
+                subtask_id INTEGER DEFAULT NULL,
+                value TEXT NOT NULL,
+                label TEXT NOT NULL DEFAULT '',
+                FOREIGN KEY (todo_id) REFERENCES todos(id) ON DELETE CASCADE,
+                FOREIGN KEY (subtask_id) REFERENCES subtasks(id) ON DELETE CASCADE
             );
             CREATE TABLE IF NOT EXISTS subtasks (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -45,6 +55,7 @@ impl SqliteStorage {
                 title TEXT NOT NULL,
                 done INTEGER DEFAULT 0,
                 priority TEXT NOT NULL DEFAULT 'medium',
+                note TEXT NOT NULL DEFAULT '',
                 FOREIGN KEY (todo_id) REFERENCES todos(id) ON DELETE CASCADE
             );
             CREATE TABLE IF NOT EXISTS notes (
@@ -100,6 +111,34 @@ impl SqliteStorage {
                         "ALTER TABLE subtasks ADD COLUMN priority TEXT NOT NULL DEFAULT 'medium';",
                     )
                     .map_err(|e| e.to_string())?,
+                // 2 -> 3: todos gained a `note`; attachments table added.
+                2 => self
+                    .conn
+                    .execute_batch(
+                        "ALTER TABLE todos ADD COLUMN note TEXT NOT NULL DEFAULT '';
+                         CREATE TABLE IF NOT EXISTS attachments (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            todo_id INTEGER NOT NULL,
+                            value TEXT NOT NULL,
+                            label TEXT NOT NULL DEFAULT '',
+                            FOREIGN KEY (todo_id) REFERENCES todos(id) ON DELETE CASCADE
+                         );",
+                    )
+                    .map_err(|e| e.to_string())?,
+                // 3 -> 4: subtasks gained a `note`.
+                3 => self
+                    .conn
+                    .execute_batch(
+                        "ALTER TABLE subtasks ADD COLUMN note TEXT NOT NULL DEFAULT '';",
+                    )
+                    .map_err(|e| e.to_string())?,
+                // 4 -> 5: attachments can belong to a subtask (NULL = todo-level).
+                4 => self
+                    .conn
+                    .execute_batch(
+                        "ALTER TABLE attachments ADD COLUMN subtask_id INTEGER DEFAULT NULL;",
+                    )
+                    .map_err(|e| e.to_string())?,
                 other => return Err(format!("no migration path from schema version {other}")),
             }
             version += 1;
@@ -145,11 +184,63 @@ impl SqliteStorage {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id, title, done, priority, due FROM todos WHERE project_id = ?1 ORDER BY id",
+                "SELECT id, title, done, priority, due, note FROM todos WHERE project_id = ?1 ORDER BY id",
             )
             .map_err(|e| e.to_string())?;
-        let rows: Vec<(i64, String, bool, String, Option<String>)> = stmt
+        let rows: Vec<(i64, String, bool, String, Option<String>, String)> = stmt
             .query_map(params![project_id], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get::<_, i64>(2)? != 0,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<_, _>>()
+            .map_err(|e| e.to_string())?;
+
+        let mut todos = Vec::with_capacity(rows.len());
+        for (id, title, done, priority, due, note) in rows {
+            let mut todo = Todo::new(&title);
+            todo.done = done;
+            todo.priority = Priority::from_label(&priority);
+            todo.due = due.and_then(|d| chrono::NaiveDate::parse_from_str(&d, "%Y-%m-%d").ok());
+            todo.note = note;
+            todo.subtasks = self.load_subtasks(id)?;
+            todo.attachments = self.load_attachments("todo_id = ?1 AND subtask_id IS NULL", id)?;
+            todos.push(todo);
+        }
+        Ok(todos)
+    }
+
+    /// Attachment rows matching `where_clause` (one `?1` bind of `id`), in insert
+    /// order.
+    fn load_attachments(&self, where_clause: &str, id: i64) -> Result<Vec<Attachment>, String> {
+        let sql = format!("SELECT value, label FROM attachments WHERE {where_clause} ORDER BY id");
+        let mut stmt = self.conn.prepare(&sql).map_err(|e| e.to_string())?;
+        stmt.query_map(params![id], |row| {
+            Ok(Attachment::new(
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<_, _>>()
+        .map_err(|e| e.to_string())
+    }
+
+    fn load_subtasks(&self, todo_id: i64) -> Result<Vec<Subtask>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, title, done, priority, note FROM subtasks WHERE todo_id = ?1 ORDER BY id",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows: Vec<(i64, String, bool, String, String)> = stmt
+            .query_map(params![todo_id], |row| {
                 Ok((
                     row.get(0)?,
                     row.get(1)?,
@@ -162,31 +253,15 @@ impl SqliteStorage {
             .collect::<Result<_, _>>()
             .map_err(|e| e.to_string())?;
 
-        let mut todos = Vec::with_capacity(rows.len());
-        for (id, title, done, priority, due) in rows {
-            let mut todo = Todo::new(&title);
-            todo.done = done;
-            todo.priority = Priority::from_label(&priority);
-            todo.due = due.and_then(|d| chrono::NaiveDate::parse_from_str(&d, "%Y-%m-%d").ok());
-            todo.subtasks = self.load_subtasks(id)?;
-            todos.push(todo);
+        let mut subs = Vec::with_capacity(rows.len());
+        for (id, title, done, priority, note) in rows {
+            let mut sub = Subtask::new(title, done);
+            sub.priority = Priority::from_label(&priority);
+            sub.note = note;
+            sub.attachments = self.load_attachments("subtask_id = ?1", id)?;
+            subs.push(sub);
         }
-        Ok(todos)
-    }
-
-    fn load_subtasks(&self, todo_id: i64) -> Result<Vec<Subtask>, String> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT title, done, priority FROM subtasks WHERE todo_id = ?1 ORDER BY id")
-            .map_err(|e| e.to_string())?;
-        stmt.query_map(params![todo_id], |row| {
-            let mut sub = Subtask::new(row.get::<_, String>(0)?, row.get::<_, i64>(1)? != 0);
-            sub.priority = Priority::from_label(&row.get::<_, String>(2)?);
-            Ok(sub)
-        })
-        .map_err(|e| e.to_string())?
-        .collect::<Result<_, _>>()
-        .map_err(|e| e.to_string())
+        Ok(subs)
     }
 
     fn load_notes(&self, project_id: i64) -> Result<Vec<Note>, String> {
@@ -232,7 +307,8 @@ impl SqliteStorage {
             .map_err(|e| e.to_string())?;
 
         tx.execute_batch(
-            "DELETE FROM subtasks;
+            "DELETE FROM attachments;
+             DELETE FROM subtasks;
              DELETE FROM todos;
              DELETE FROM notes;
              DELETE FROM milestones;
@@ -250,13 +326,14 @@ impl SqliteStorage {
 
             for todo in &project.todos {
                 tx.execute(
-                    "INSERT INTO todos (project_id, title, done, priority, due) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    "INSERT INTO todos (project_id, title, done, priority, due, note) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                     params![
                         pid,
                         todo.title,
                         todo.done as i64,
                         todo.priority.label(),
                         todo.due.map(|d| d.format("%Y-%m-%d").to_string()),
+                        todo.note,
                     ],
                 )
                 .map_err(|e| e.to_string())?;
@@ -264,8 +341,25 @@ impl SqliteStorage {
 
                 for sub in &todo.subtasks {
                     tx.execute(
-                        "INSERT INTO subtasks (todo_id, title, done, priority) VALUES (?1, ?2, ?3, ?4)",
-                        params![tid, sub.title, sub.done as i64, sub.priority.label()],
+                        "INSERT INTO subtasks (todo_id, title, done, priority, note) VALUES (?1, ?2, ?3, ?4, ?5)",
+                        params![tid, sub.title, sub.done as i64, sub.priority.label(), sub.note],
+                    )
+                    .map_err(|e| e.to_string())?;
+                    let sid = tx.last_insert_rowid();
+
+                    for att in &sub.attachments {
+                        tx.execute(
+                            "INSERT INTO attachments (todo_id, subtask_id, value, label) VALUES (?1, ?2, ?3, ?4)",
+                            params![tid, sid, att.value, att.label],
+                        )
+                        .map_err(|e| e.to_string())?;
+                    }
+                }
+
+                for att in &todo.attachments {
+                    tx.execute(
+                        "INSERT INTO attachments (todo_id, value, label) VALUES (?1, ?2, ?3)",
+                        params![tid, att.value, att.label],
                     )
                     .map_err(|e| e.to_string())?;
                 }
@@ -294,5 +388,48 @@ impl SqliteStorage {
         }
 
         tx.commit().map_err(|e| e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Attachment, Project, Subtask, Todo};
+
+    #[test]
+    fn round_trips_todo_note_and_attachments() {
+        let dir = std::env::temp_dir().join(format!("voido-test-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&dir);
+        let db = SqliteStorage::open(&dir).unwrap();
+
+        let mut store = Store::default();
+        let mut p = Project::new("P");
+        let mut t = Todo::new("write docs");
+        t.note = "# heading\n\nsome **body**".into();
+        t.attachments = vec![
+            Attachment::new("https://example.com", "site"),
+            Attachment::new("/tmp/pic.png", ""),
+        ];
+        let mut sub = Subtask::new("outline", false);
+        sub.note = "cover the migration path".into();
+        sub.attachments = vec![Attachment::new("https://rfc.example/1", "RFC")];
+        t.subtasks.push(sub);
+        p.todos.push(t);
+        store.projects.push(p);
+
+        db.save(&store).unwrap();
+        let loaded = db.load().unwrap();
+        let lt = &loaded.projects[0].todos[0];
+        assert_eq!(lt.note, "# heading\n\nsome **body**");
+        assert_eq!(lt.attachments.len(), 2);
+        assert_eq!(lt.attachments[0].label, "site");
+        assert_eq!(lt.attachments[1].value, "/tmp/pic.png");
+        assert_eq!(lt.subtasks[0].note, "cover the migration path");
+        assert_eq!(lt.subtasks[0].attachments.len(), 1);
+        assert_eq!(lt.subtasks[0].attachments[0].label, "RFC");
+        // Todo-level attachments must not leak into the subtask and vice versa.
+        assert_eq!(lt.attachments.len(), 2);
+
+        let _ = std::fs::remove_file(&dir);
     }
 }

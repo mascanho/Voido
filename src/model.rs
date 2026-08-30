@@ -30,6 +30,15 @@ impl Priority {
         }
     }
 
+    /// Sort weight, highest-priority first (High = 0).
+    pub fn rank(self) -> u8 {
+        match self {
+            Priority::High => 0,
+            Priority::Medium => 1,
+            Priority::Low => 2,
+        }
+    }
+
     /// Cycle low -> med -> high -> low.
     pub fn next(self) -> Self {
         match self {
@@ -47,6 +56,11 @@ pub struct Subtask {
     pub done: bool,
     #[serde(default)]
     pub priority: Priority,
+    /// Free-form Markdown note attached to this subtask.
+    #[serde(default)]
+    pub note: String,
+    #[serde(default)]
+    pub attachments: Vec<Attachment>,
 }
 
 impl Subtask {
@@ -55,6 +69,63 @@ impl Subtask {
             title: title.into(),
             done,
             priority: Priority::Medium,
+            note: String::new(),
+            attachments: Vec::new(),
+        }
+    }
+}
+
+/// A link, file or image attached to a todo. The kind is inferred from `value`
+/// (a `http(s)://` prefix -> link; an image file extension -> image; otherwise a
+/// plain file path).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Attachment {
+    /// URL or filesystem path.
+    pub value: String,
+    /// Optional display label; falls back to `value` when empty.
+    #[serde(default)]
+    pub label: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachmentKind {
+    Link,
+    Image,
+    File,
+}
+
+impl Attachment {
+    pub fn new(value: impl Into<String>, label: impl Into<String>) -> Self {
+        Self {
+            value: value.into(),
+            label: label.into(),
+        }
+    }
+
+    pub fn kind(&self) -> AttachmentKind {
+        let v = self.value.trim();
+        if v.starts_with("http://") || v.starts_with("https://") || v.starts_with("www.") {
+            return AttachmentKind::Link;
+        }
+        let lower = v.to_ascii_lowercase();
+        let is_image = [
+            ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp", ".tiff", ".heic",
+        ]
+        .iter()
+        .any(|ext| lower.ends_with(ext));
+        if is_image {
+            AttachmentKind::Image
+        } else {
+            AttachmentKind::File
+        }
+    }
+
+    /// What to show for this attachment: the label, or the value when unlabelled.
+    pub fn display(&self) -> &str {
+        if self.label.trim().is_empty() {
+            &self.value
+        } else {
+            &self.label
         }
     }
 }
@@ -70,6 +141,11 @@ pub struct Todo {
     pub due: Option<NaiveDate>,
     #[serde(default)]
     pub subtasks: Vec<Subtask>,
+    /// Free-form Markdown note attached to this todo.
+    #[serde(default)]
+    pub note: String,
+    #[serde(default)]
+    pub attachments: Vec<Attachment>,
 }
 
 impl Todo {
@@ -80,6 +156,8 @@ impl Todo {
             priority: Priority::Medium,
             due: None,
             subtasks: Vec::new(),
+            note: String::new(),
+            attachments: Vec::new(),
         }
     }
 
@@ -89,6 +167,19 @@ impl Todo {
             self.subtasks.iter().filter(|s| s.done).count(),
             self.subtasks.len(),
         )
+    }
+
+    /// Keep `done` in lockstep with the subtasks: a todo that has subtasks is
+    /// done exactly when every one of them is. A todo with no subtasks keeps
+    /// whatever `done` state it was given. Returns `true` if `done` changed.
+    pub fn recompute_done(&mut self) -> bool {
+        if self.subtasks.is_empty() {
+            return false;
+        }
+        let all_done = self.subtasks.iter().all(|s| s.done);
+        let changed = self.done != all_done;
+        self.done = all_done;
+        changed
     }
 }
 
@@ -315,6 +406,54 @@ fn due(mut t: Todo, d: NaiveDate) -> Todo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attachment_kind_inference() {
+        assert_eq!(
+            Attachment::new("https://example.com", "").kind(),
+            AttachmentKind::Link
+        );
+        assert_eq!(
+            Attachment::new("/home/me/diagram.PNG", "").kind(),
+            AttachmentKind::Image
+        );
+        assert_eq!(
+            Attachment::new("./notes/spec.pdf", "").kind(),
+            AttachmentKind::File
+        );
+    }
+
+    #[test]
+    fn attachment_display_prefers_label() {
+        assert_eq!(Attachment::new("/x/y.pdf", "Spec").display(), "Spec");
+        assert_eq!(Attachment::new("/x/y.pdf", "  ").display(), "/x/y.pdf");
+    }
+
+    #[test]
+    fn priority_rank_orders_high_first() {
+        let mut v = [Priority::Low, Priority::High, Priority::Medium];
+        v.sort_by_key(|p| p.rank());
+        assert_eq!(v, [Priority::High, Priority::Medium, Priority::Low]);
+    }
+
+    #[test]
+    fn recompute_done_follows_subtasks() {
+        let mut t = Todo::new("parent");
+        assert!(!t.recompute_done(), "no subtasks -> untouched");
+        assert!(!t.done);
+
+        t.subtasks = vec![Subtask::new("a", true), Subtask::new("b", false)];
+        assert!(!t.recompute_done());
+        assert!(!t.done, "one subtask open -> parent open");
+
+        t.subtasks[1].done = true;
+        assert!(t.recompute_done(), "all done -> parent flips to done");
+        assert!(t.done);
+
+        t.subtasks.push(Subtask::new("c", false));
+        assert!(t.recompute_done(), "new open subtask -> parent reopens");
+        assert!(!t.done);
+    }
 
     #[test]
     fn is_complete_needs_every_child_done() {

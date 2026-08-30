@@ -94,15 +94,16 @@ is skipped with a message on startup.
 The resolved token also lifts the anonymous rate limit on the repo-activity view
 (`^g` to link a code repo, `o` to view).
 
-A project shows `✔` (struck through) once every todo, subtask and milestone in
-it is done — it can't be ticked on its own.
+Each project gets its own icon in the rail (picked from its name, so it's stable
+between runs). The icon's colour is the status: dim = empty, accent = open
+todos, green = everything done — and a finished project's name is struck through.
 
 ## Layout
 
 ```
  ╭ Projects ─╮╭ Overview  Todos  Notes  Schedule ─── Website ╮╭ Subtasks 1/3 ╮
- │ ● Website ││ ○ Design system in Figma   high   Sep 01     ││ ✔ Hero        │
- │ ● Voido   ││ ○ Rebuild the home page    med  ⊞ 1/3        ││ ○ Nav+footer  │
+ │ ◈ Website ││ ○ Design system in Figma   high   Sep 01     ││ ✔ Hero        │
+ │ ◆ Voido   ││ ○ Rebuild the home page    med  ⊞ 1/3        ││ ○ Nav+footer  │
  ╰───────────╯╰──────────────────────────────────────────────╯╰──────────────╯
   NORMAL  TODOS   <status>   context key hints          Website > todos
 ```
@@ -112,7 +113,15 @@ the right pane shows subtasks (Todos) or the note body (Notes).
 
 - **Overview** — description, todo/subtask progress bar, note count, next milestone
 - **Todos** — checkbox, priority, due date, subtask progress; `l` opens the
-  **Subtasks** pane on the right for the selected todo
+  **Subtasks** pane on the right for the selected todo. `o` sorts the list by
+  priority. A todo that has subtasks is ticked automatically once they're all
+  done (and un-ticked if one reopens). Each todo **and subtask** can carry a
+  Markdown **note** (`¶`) and a list of **attachments** — links, files or images
+  (`A`, marked `📎`); `o` / `enter` in the manager hands the item to your system
+  opener.
+  - `N` edits a note; `n` shows the rendered note — a **todo's** note fills the
+    Subtasks pane, a **subtask's** (`↳`) opens in a section below the subtask
+    list. `n` again hides it; `^d` / `^u` scroll it
 - **Notes** — quick per-project notes; `x` pins one (★). `l` opens the note's
   **Markdown body** in the right pane, rendered properly (headings, nested
   lists, block quotes, fenced code, rules, `**bold**` / `*italic*` / `` `code` ``).
@@ -128,15 +137,17 @@ time for the full list.
 
 | Scope | Keys |
 | --- | --- |
-| Global | `h`/`l` switch pane · `w`/`s` prev/next project · `tab`/`S-tab` switch view · `1`‑`4` jump to a view · `gg`/`G` top/bottom · `esc` back out · `^t` theme · `^y` GitHub sync · `^e` edit settings file · `?` help · `q` quit |
+| Global | `h`/`l` switch pane · `w`/`s` prev/next project · `tab`/`S-tab` switch view · `1`‑`4` jump to a view · `gg`/`G` top/bottom · `esc` back out · `/` fuzzy find · `m` minimal view · `^t` theme · `^y` GitHub sync · `^e` edit settings file · `?` help · `q` quit |
 | Projects | `a` add · `r` rename · `d` delete · `l` open · `^g` link/unlink code repo · `o` repo activity |
 | Overview | `e` edit description · `r` rename |
-| Todos | `a` add · `e` edit · `d` delete · `x` (or space) done · `p` priority · `J`/`K` reorder · `l` subtasks |
-| Subtasks | `a` add · `e` edit · `d` delete · `x` done · `p` priority · `J`/`K` reorder · `h` back |
+| Todos | `a` add · `e` edit · `d` delete · `x` (or space) done · `p` priority · `o` sort by priority · `J`/`K` reorder · `l` subtasks · `n` view note · `N` edit note · `A` attachments |
+| Subtasks | `a` add · `e` edit · `d` delete · `x` done · `p` priority · `J`/`K` reorder · `n` view note · `N` edit note · `^d`/`^u` scroll note · `A` attachments · `h` back |
 | Notes | `a` add · `e` edit title · `d` delete · `x` pin · `J`/`K` reorder · `l` open body |
 | Note body | `j`/`k` · `^d`/`^u` scroll · `space` expand · `e` edit · `h` back |
 | MD editor | type freely · `esc` / `^s` save & close |
 | Schedule | `a` add milestone · `e`/`d` edit/delete · `x` done · `r` reschedule · `f` cycle filter · `l` jump to todo |
+| Find (`/`) | type to filter projects, todos & notes · `↑`/`↓` or `^n`/`^p` move · `enter` jump · `esc` cancel |
+| Attachments (`A`) | `a` add a URL or path (append `\| label` to name it) · `o`/`enter` open with the system opener · `d` remove · `esc` close |
 
 ### Quick-add syntax
 

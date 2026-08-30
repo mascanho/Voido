@@ -14,7 +14,7 @@ use tui_textarea::{CursorMove, TextArea};
 
 use crate::config::{Config, StorageChoice};
 use crate::github::{GitHubClient, RepoInfo, SyncClient};
-use crate::model::{Milestone, Note, Priority, Project, Store, Subtask, Todo};
+use crate::model::{Attachment, Milestone, Note, Priority, Project, Store, Subtask, Todo};
 use crate::util::truncate;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,6 +117,8 @@ pub enum InputAction {
     EditSubtask(usize),
     AddNote,
     EditNote(usize),
+    /// Add an attachment to this target; returns to the manager afterwards.
+    AddAttachment(AttachTarget),
     AddMilestone,
     EditMilestone(usize),
     RescheduleTodo(usize),
@@ -154,10 +156,72 @@ pub struct ConfirmState {
     pub action: ConfirmAction,
 }
 
-/// Full-screen markdown editor for a note body.
+/// What a Markdown editor session is writing to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditTarget {
+    /// The body of the project note at this index.
+    NoteBody(usize),
+    /// The note attached to the todo at this index.
+    TodoNote(usize),
+    /// The note attached to the current todo's subtask at this index.
+    SubtaskNote(usize),
+}
+
+/// Which note the Todos-tab detail pane is rendering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DetailNote {
+    /// The selected todo's own note (fills the detail pane).
+    Todo,
+    /// The note of the todo's subtask at this index (section below the list).
+    Subtask(usize),
+}
+
+/// Markdown editor for a note body or a todo's attached note.
 pub struct EditState {
-    pub note_idx: usize,
+    pub target: EditTarget,
     pub textarea: TextArea<'static>,
+}
+
+/// What a set of attachments hangs off: a todo, or one of its subtasks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttachTarget {
+    pub todo_idx: usize,
+    /// `Some(i)` when the manager is for subtask `i` of that todo.
+    pub sub_idx: Option<usize>,
+}
+
+/// The attachment manager overlay.
+pub struct AttachState {
+    pub target: AttachTarget,
+    pub sel: usize,
+}
+
+/// The fuzzy-finder overlay.
+pub struct SearchState {
+    pub editor: TextArea<'static>,
+    pub sel: usize,
+}
+
+impl SearchState {
+    pub fn query(&self) -> String {
+        self.editor.lines().first().cloned().unwrap_or_default()
+    }
+}
+
+/// Where a fuzzy-search hit points.
+#[derive(Debug, Clone, Copy)]
+pub enum SearchTarget {
+    Project,
+    Todo(usize),
+    Note(usize),
+}
+
+#[derive(Debug, Clone)]
+pub struct SearchHit {
+    pub project_idx: usize,
+    pub target: SearchTarget,
+    pub label: String,
+    pub context: String,
 }
 
 /// Theme picker. Moving the cursor previews the theme live; `esc` restores the
@@ -185,6 +249,10 @@ pub enum Mode {
     Theme(ThemeState),
     /// A dismissible message popup — (title, body). Used for sync results.
     Notice(String, String),
+    /// Attachment manager for the current todo.
+    Attach(AttachState),
+    /// Global fuzzy finder.
+    Search(Box<SearchState>),
 }
 
 pub struct App {
@@ -197,7 +265,16 @@ pub struct App {
     pub note_idx: usize,
     pub note_scroll: u16,
     pub note_expanded: bool,
+    /// `n` toggles the selected todo's note into the detail pane; `n` inside the
+    /// Subtasks pane toggles the selected subtask's note into a section below the
+    /// list. Independent, each with its own `^d` / `^u` scroll offset.
+    pub todo_note_open: bool,
+    pub sub_note_open: bool,
+    pub todo_note_scroll: u16,
+    pub sub_note_scroll: u16,
     pub project_info: bool,
+    /// `m` toggles a stripped-back layout (no hint bar, minimal header).
+    pub minimal: bool,
     pub timeline_idx: usize,
     pub deadline_filter: DeadlineFilter,
     pub mode: Mode,
@@ -245,11 +322,18 @@ pub struct SyncOk {
 
 impl App {
     pub fn new(
-        store: Store,
+        mut store: Store,
         config: Config,
         sync_sha: Option<String>,
         sync_token: Option<String>,
     ) -> Self {
+        // Enforce the "todo with subtasks is done iff they all are" invariant on
+        // whatever we loaded (local DB, legacy import or GitHub sync).
+        for p in &mut store.projects {
+            for t in &mut p.todos {
+                t.recompute_done();
+            }
+        }
         let gh_client = GitHubClient::new(sync_token.clone());
         Self {
             store,
@@ -260,8 +344,13 @@ impl App {
             subtask_idx: 0,
             note_idx: 0,
             note_scroll: 0,
+            todo_note_open: false,
+            sub_note_open: false,
+            todo_note_scroll: 0,
+            sub_note_scroll: 0,
             note_expanded: false,
             project_info: false,
+            minimal: false,
             timeline_idx: 0,
             deadline_filter: DeadlineFilter::All,
             mode: Mode::Normal,
@@ -491,8 +580,82 @@ impl App {
         self.current_project_mut()?.todos.get_mut(i)
     }
 
+    /// After a subtask edit, pull the parent todo's `done` back in line with its
+    /// subtasks (all done -> todo done; any open -> todo open).
+    fn sync_parent_done(&mut self) {
+        if let Some(t) = self.current_todo_mut()
+            && t.recompute_done()
+        {
+            self.dirty = true;
+        }
+    }
+
     pub fn current_note(&self) -> Option<&Note> {
         self.current_project()?.notes.get(self.note_idx)
+    }
+
+    /// `n` at todo level toggled the selected todo's note into the detail pane
+    /// (3rd pane), and it has a non-empty note to show.
+    pub fn showing_todo_note(&self) -> bool {
+        self.tab == Tab::Todos
+            && self.focus != Focus::Detail
+            && self.todo_note_open
+            && self
+                .current_todo()
+                .is_some_and(|t| !t.note.trim().is_empty())
+    }
+
+    /// `n` inside the Subtasks pane toggled the selected subtask's note into a
+    /// section below the subtask list (4th pane), and it has one to show.
+    pub fn showing_sub_note(&self) -> bool {
+        self.tab == Tab::Todos
+            && self.focus == Focus::Detail
+            && self.sub_note_open
+            && self
+                .current_todo()
+                .and_then(|t| t.subtasks.get(self.subtask_idx))
+                .is_some_and(|s| !s.note.trim().is_empty())
+    }
+
+    /// `n` on a todo: flip its note in/out of the detail pane.
+    fn toggle_todo_note(&mut self) {
+        match self.current_todo() {
+            Some(t) if !t.note.trim().is_empty() => {
+                self.todo_note_open = !self.todo_note_open;
+                self.todo_note_scroll = 0;
+            }
+            Some(_) => self.status = "no note yet — press N to write one".into(),
+            None => {}
+        }
+    }
+
+    /// `n` on a subtask: flip its note in/out of the pane below the list.
+    fn toggle_sub_note(&mut self) {
+        match self
+            .current_todo()
+            .and_then(|t| t.subtasks.get(self.subtask_idx))
+        {
+            Some(s) if !s.note.trim().is_empty() => {
+                self.sub_note_open = !self.sub_note_open;
+                self.sub_note_scroll = 0;
+            }
+            Some(_) => self.status = "no note yet — press N to write one".into(),
+            None => {}
+        }
+    }
+
+    /// Scroll whichever detail note is currently on screen.
+    fn scroll_detail_note(&mut self, delta: i32) {
+        let target = if self.showing_sub_note() {
+            &mut self.sub_note_scroll
+        } else {
+            &mut self.todo_note_scroll
+        };
+        *target = if delta < 0 {
+            target.saturating_sub((-delta) as u16)
+        } else {
+            target.saturating_add(delta as u16)
+        };
     }
 
     /// Whether the right-hand detail pane has something to show right now.
@@ -635,6 +798,17 @@ impl App {
             .map(|n| n.body.lines().count() as u16 + 8)
             .unwrap_or(0);
         self.note_scroll = self.note_scroll.min(body_lines.saturating_sub(1));
+        let todo_note_lines = self
+            .current_todo()
+            .map(|t| t.note.lines().count() as u16)
+            .unwrap_or(0);
+        self.todo_note_scroll = self.todo_note_scroll.min(todo_note_lines.saturating_add(4));
+        let sub_note_lines = self
+            .current_todo()
+            .and_then(|t| t.subtasks.get(self.subtask_idx))
+            .map(|s| s.note.lines().count() as u16)
+            .unwrap_or(0);
+        self.sub_note_scroll = self.sub_note_scroll.min(sub_note_lines.saturating_add(4));
         let tl = self.timeline().len();
         self.timeline_idx = self.timeline_idx.min(tl.saturating_sub(1));
 
@@ -652,6 +826,8 @@ impl App {
             Mode::Confirm(_) => self.handle_confirm(key),
             Mode::EditBody(_) => self.handle_edit_body(key),
             Mode::Theme(_) => self.handle_theme(key),
+            Mode::Attach(_) => self.handle_attach(key),
+            Mode::Search(_) => self.handle_search(key),
             Mode::Help(_) => match key.code {
                 KeyCode::Left | KeyCode::Char('h') => {
                     self.mode = Mode::Help(HelpTab::General);
@@ -715,6 +891,7 @@ impl App {
                 let len = self.current_todo().map(|t| t.subtasks.len()).unwrap_or(0);
                 if let Some(i) = row_at(r.detail, pos.y, len) {
                     self.subtask_idx = i;
+                    self.sub_note_scroll = 0;
                 }
             }
             return true;
@@ -728,6 +905,8 @@ impl App {
                     if let Some(i) = row_at(r.content, pos.y, len) {
                         self.todo_idx = i;
                         self.subtask_idx = 0;
+                        self.todo_note_scroll = 0;
+                        self.sub_note_scroll = 0;
                     }
                 }
                 Tab::Notes => {
@@ -773,6 +952,17 @@ impl App {
                 KeyCode::Char('u') if self.focus == Focus::Detail && self.tab == Tab::Notes => {
                     self.note_scroll = self.note_scroll.saturating_sub(10);
                 }
+                // scroll the note(s) shown under the subtask list
+                KeyCode::Char('d')
+                    if self.showing_todo_note() || self.showing_sub_note() =>
+                {
+                    self.scroll_detail_note(6);
+                }
+                KeyCode::Char('u')
+                    if self.showing_todo_note() || self.showing_sub_note() =>
+                {
+                    self.scroll_detail_note(-6);
+                }
                 _ => {}
             }
             return;
@@ -783,6 +973,15 @@ impl App {
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('?') => self.mode = Mode::Help(HelpTab::General),
+            KeyCode::Char('/') => self.open_search(),
+            KeyCode::Char('m') => {
+                self.minimal = !self.minimal;
+                self.status = if self.minimal {
+                    "minimal view — m to restore".into()
+                } else {
+                    "full view".into()
+                };
+            }
             // Tab switches the content view (Overview / Todos / Notes / Schedule).
             KeyCode::Tab => self.cycle_tab(true),
             KeyCode::BackTab => self.cycle_tab(false),
@@ -875,9 +1074,11 @@ impl App {
             KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => {
                 if self.current_todo().is_some() {
                     self.subtask_idx = 0;
+                    self.sub_note_scroll = 0;
                     self.focus = Focus::Detail;
                 }
             }
+            KeyCode::Char('n') => self.toggle_todo_note(),
             KeyCode::Char('a') => {
                 if self.current_project().is_some() {
                     self.begin_input(
@@ -931,8 +1132,31 @@ impl App {
             }
             KeyCode::Char('J') => self.reorder_todo(1),
             KeyCode::Char('K') => self.reorder_todo(-1),
+            KeyCode::Char('o') => self.sort_todos_by_priority(),
+            KeyCode::Char('N') => self.begin_edit_todo_note(),
+            KeyCode::Char('A') => self.open_attachments(),
             _ => {}
         }
+    }
+
+    /// Stable-sort the current project's todos, highest priority first. Keeps the
+    /// selection on the same todo.
+    fn sort_todos_by_priority(&mut self) {
+        let selected_title = self.current_todo().map(|t| t.title.clone());
+        if let Some(p) = self.current_project_mut() {
+            if p.todos.len() < 2 {
+                return;
+            }
+            p.todos.sort_by_key(|t| t.priority.rank());
+            self.dirty = true;
+        }
+        if let (Some(title), Some(p)) = (selected_title, self.current_project())
+            && let Some(i) = p.todos.iter().position(|t| t.title == title)
+        {
+            self.todo_idx = i;
+        }
+        self.subtask_idx = 0;
+        self.status = "sorted by priority".into();
     }
 
     fn reorder_todo(&mut self, delta: i32) {
@@ -959,6 +1183,7 @@ impl App {
             KeyCode::Char('j') | KeyCode::Down => self.move_sel(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_sel(-1),
             KeyCode::Char('h') | KeyCode::Left => self.focus = Focus::Content,
+            KeyCode::Char('n') => self.toggle_sub_note(),
             KeyCode::Char('a') => {
                 if self.current_todo().is_some() {
                     self.begin_input(
@@ -984,6 +1209,7 @@ impl App {
                     s.done = !s.done;
                     self.dirty = true;
                 }
+                self.sync_parent_done();
             }
             KeyCode::Char('p') => {
                 let i = self.subtask_idx;
@@ -1007,6 +1233,8 @@ impl App {
             }
             KeyCode::Char('J') => self.reorder_subtask(1),
             KeyCode::Char('K') => self.reorder_subtask(-1),
+            KeyCode::Char('N') => self.begin_edit_subtask_note(),
+            KeyCode::Char('A') => self.open_subtask_attachments(),
             _ => {}
         }
     }
@@ -1153,18 +1381,47 @@ impl App {
         let Some(note) = self.current_note() else {
             return;
         };
-        let lines: Vec<String> = if note.body.is_empty() {
+        let body = note.body.clone();
+        self.begin_edit(EditTarget::NoteBody(self.note_idx), &body);
+        self.status = "editing note — esc / ^s to save".into();
+    }
+
+    /// Open the Markdown editor on the current todo's attached note.
+    fn begin_edit_todo_note(&mut self) {
+        let Some(todo) = self.current_todo() else {
+            self.status = "pick a todo first".into();
+            return;
+        };
+        let note = todo.note.clone();
+        self.begin_edit(EditTarget::TodoNote(self.todo_idx), &note);
+        self.status = "editing todo note — esc / ^s to save".into();
+    }
+
+    /// Open the Markdown editor on the selected subtask's attached note.
+    fn begin_edit_subtask_note(&mut self) {
+        let Some(sub) = self
+            .current_todo()
+            .and_then(|t| t.subtasks.get(self.subtask_idx))
+        else {
+            self.status = "pick a subtask first".into();
+            return;
+        };
+        let note = sub.note.clone();
+        self.begin_edit(EditTarget::SubtaskNote(self.subtask_idx), &note);
+        self.status = "editing subtask note — esc / ^s to save".into();
+    }
+
+    fn begin_edit(&mut self, target: EditTarget, initial: &str) {
+        let lines: Vec<String> = if initial.is_empty() {
             vec![String::new()]
         } else {
-            note.body.lines().map(str::to_string).collect()
+            initial.lines().map(str::to_string).collect()
         };
         let mut textarea = TextArea::new(lines);
+        textarea.move_cursor(CursorMove::Bottom);
+        textarea.move_cursor(CursorMove::End);
         textarea.set_placeholder_text("Write in Markdown…  # heading, - bullet, **bold**, `code`");
-        self.mode = Mode::EditBody(Box::new(EditState {
-            note_idx: self.note_idx,
-            textarea,
-        }));
-        self.status = "editing note — esc / ^s to save".into();
+        self.mode = Mode::EditBody(Box::new(EditState { target, textarea }));
     }
 
     fn handle_edit_body(&mut self, key: KeyEvent) {
@@ -1184,17 +1441,267 @@ impl App {
         let Mode::EditBody(state) = std::mem::replace(&mut self.mode, Mode::Normal) else {
             return;
         };
-        let body = state.textarea.lines().join("\n");
-        let body = body.trim_end().to_string();
-        if let Some(n) = self
-            .current_project_mut()
-            .and_then(|p| p.notes.get_mut(state.note_idx))
-        {
-            n.body = body;
-            self.dirty = true;
-            self.status = "note saved".into();
+        let body = state.textarea.lines().join("\n").trim_end().to_string();
+        match state.target {
+            EditTarget::NoteBody(i) => {
+                if let Some(n) = self.current_project_mut().and_then(|p| p.notes.get_mut(i)) {
+                    n.body = body;
+                    self.dirty = true;
+                    self.status = "note saved".into();
+                }
+                self.note_scroll = 0;
+            }
+            EditTarget::TodoNote(i) => {
+                if let Some(t) = self.current_project_mut().and_then(|p| p.todos.get_mut(i)) {
+                    t.note = body;
+                    self.dirty = true;
+                    self.status = "todo note saved".into();
+                }
+            }
+            EditTarget::SubtaskNote(i) => {
+                let ti = self.todo_idx;
+                if let Some(s) = self
+                    .current_project_mut()
+                    .and_then(|p| p.todos.get_mut(ti))
+                    .and_then(|t| t.subtasks.get_mut(i))
+                {
+                    s.note = body;
+                    self.dirty = true;
+                    self.status = "subtask note saved".into();
+                }
+            }
         }
-        self.note_scroll = 0;
+    }
+
+    // ---- attachments -------------------------------------------
+
+    /// Open the manager for the todo selected in the Todos tab.
+    fn open_attachments(&mut self) {
+        if self.current_todo().is_none() {
+            self.status = "pick a todo first".into();
+            return;
+        }
+        self.open_attachments_for(AttachTarget {
+            todo_idx: self.todo_idx,
+            sub_idx: None,
+        });
+    }
+
+    /// Open the manager for the subtask selected in the Subtasks pane.
+    fn open_subtask_attachments(&mut self) {
+        let Some(t) = self.current_todo() else {
+            self.status = "pick a todo first".into();
+            return;
+        };
+        if self.subtask_idx >= t.subtasks.len() {
+            self.status = "pick a subtask first".into();
+            return;
+        }
+        self.open_attachments_for(AttachTarget {
+            todo_idx: self.todo_idx,
+            sub_idx: Some(self.subtask_idx),
+        });
+    }
+
+    fn open_attachments_for(&mut self, target: AttachTarget) {
+        self.mode = Mode::Attach(AttachState { target, sel: 0 });
+    }
+
+    /// The attachment list a target points at (read-only).
+    pub fn attachments_at(&self, t: AttachTarget) -> Option<&Vec<Attachment>> {
+        let todo = self.current_project()?.todos.get(t.todo_idx)?;
+        match t.sub_idx {
+            None => Some(&todo.attachments),
+            Some(i) => todo.subtasks.get(i).map(|s| &s.attachments),
+        }
+    }
+
+    fn attachments_at_mut(&mut self, t: AttachTarget) -> Option<&mut Vec<Attachment>> {
+        let todo = self.current_project_mut()?.todos.get_mut(t.todo_idx)?;
+        match t.sub_idx {
+            None => Some(&mut todo.attachments),
+            Some(i) => todo.subtasks.get_mut(i).map(|s| &mut s.attachments),
+        }
+    }
+
+    fn handle_attach(&mut self, key: KeyEvent) {
+        let Mode::Attach(state) = &self.mode else {
+            return;
+        };
+        let (target, sel) = (state.target, state.sel);
+        let len = self.attachments_at(target).map(Vec::len).unwrap_or(0);
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('h') => self.mode = Mode::Normal,
+            KeyCode::Char('j') | KeyCode::Down => {
+                if let Mode::Attach(s) = &mut self.mode {
+                    s.sel = step(sel, 1, len);
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if let Mode::Attach(s) = &mut self.mode {
+                    s.sel = step(sel, -1, len);
+                }
+            }
+            KeyCode::Char('a') => self.begin_input(
+                "Attachment — URL or path   (append  | label  to name it)",
+                String::new(),
+                InputAction::AddAttachment(target),
+            ),
+            KeyCode::Char('d') => {
+                if let Some(list) = self.attachments_at_mut(target)
+                    && sel < list.len()
+                {
+                    list.remove(sel);
+                    self.dirty = true;
+                    self.status = "attachment removed".into();
+                }
+                if let Mode::Attach(s) = &mut self.mode {
+                    s.sel = s.sel.min(len.saturating_sub(2));
+                }
+            }
+            KeyCode::Char('o') | KeyCode::Char('l') | KeyCode::Enter => {
+                if let Some(a) = self
+                    .attachments_at(target)
+                    .and_then(|list| list.get(sel))
+                    .map(|a| a.value.clone())
+                {
+                    self.open_external(&a);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Hand a URL or path to the OS opener (`open` / `xdg-open` / `explorer`).
+    fn open_external(&mut self, target: &str) {
+        let target = target.trim();
+        if target.is_empty() {
+            return;
+        }
+        let program = if cfg!(target_os = "macos") {
+            "open"
+        } else if cfg!(target_os = "windows") {
+            "explorer"
+        } else {
+            "xdg-open"
+        };
+        match std::process::Command::new(program)
+            .arg(target)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(_) => self.status = format!("opening {}", truncate(target, 40)),
+            Err(e) => self.status = format!("could not open: {e}"),
+        }
+    }
+
+    // ---- fuzzy finder -----------------------------------------
+
+    fn open_search(&mut self) {
+        let mut editor = TextArea::new(vec![String::new()]);
+        editor.set_placeholder_text("Fuzzy-find a project, todo or note…");
+        self.mode = Mode::Search(Box::new(SearchState { editor, sel: 0 }));
+    }
+
+    /// Score every project / todo / note against the current query. Empty query
+    /// lists everything (projects first, then todos, then notes, per project).
+    pub fn search_results(&self) -> Vec<SearchHit> {
+        let q = match &self.mode {
+            Mode::Search(s) => s.query().trim().to_lowercase(),
+            _ => return Vec::new(),
+        };
+        let mut scored: Vec<(i32, usize, SearchHit)> = Vec::new();
+        for (pi, p) in self.store.projects.iter().enumerate() {
+            let consider =
+                |cand: &str, target: SearchTarget, context: &str, out: &mut Vec<(i32, usize, SearchHit)>| {
+                    let score = if q.is_empty() {
+                        Some(0)
+                    } else {
+                        fuzzy_score(&q, &cand.to_lowercase())
+                    };
+                    if let Some(score) = score {
+                        let order = out.len();
+                        out.push((
+                            score,
+                            order,
+                            SearchHit {
+                                project_idx: pi,
+                                target,
+                                label: cand.to_string(),
+                                context: context.to_string(),
+                            },
+                        ));
+                    }
+                };
+            consider(&p.name, SearchTarget::Project, "project", &mut scored);
+            for (ti, t) in p.todos.iter().enumerate() {
+                consider(&t.title, SearchTarget::Todo(ti), &p.name, &mut scored);
+            }
+            for (ni, n) in p.notes.iter().enumerate() {
+                consider(&n.text, SearchTarget::Note(ni), &p.name, &mut scored);
+            }
+        }
+        // Highest score first; stable on insertion order for ties / empty query.
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        scored.truncate(40);
+        scored.into_iter().map(|(_, _, h)| h).collect()
+    }
+
+    fn move_search_sel(&mut self, delta: i32) {
+        let len = self.search_results().len();
+        if let Mode::Search(s) = &mut self.mode {
+            s.sel = step(s.sel, delta, len);
+        }
+    }
+
+    fn commit_search(&mut self) {
+        let sel = match &self.mode {
+            Mode::Search(s) => s.sel,
+            _ => return,
+        };
+        let Some(hit) = self.search_results().get(sel).cloned() else {
+            self.mode = Mode::Normal;
+            return;
+        };
+        self.project_idx = hit.project_idx;
+        self.reset_content_idx();
+        match hit.target {
+            SearchTarget::Project => self.focus = Focus::Projects,
+            SearchTarget::Todo(i) => {
+                self.tab = Tab::Todos;
+                self.todo_idx = i;
+                self.subtask_idx = 0;
+                self.focus = Focus::Content;
+            }
+            SearchTarget::Note(i) => {
+                self.tab = Tab::Notes;
+                self.note_idx = i;
+                self.note_scroll = 0;
+                self.focus = Focus::Content;
+            }
+        }
+        self.mode = Mode::Normal;
+        self.status = format!("jumped to {}", truncate(&hit.label, 40));
+    }
+
+    fn handle_search(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => self.mode = Mode::Normal,
+            KeyCode::Enter => self.commit_search(),
+            KeyCode::Down | KeyCode::Tab => self.move_search_sel(1),
+            KeyCode::Up | KeyCode::BackTab => self.move_search_sel(-1),
+            KeyCode::Char('n') if ctrl => self.move_search_sel(1),
+            KeyCode::Char('p') if ctrl => self.move_search_sel(-1),
+            _ => {
+                if let Mode::Search(s) = &mut self.mode {
+                    s.editor.input(key);
+                    s.sel = 0;
+                }
+            }
+        }
     }
 
     // ---- theme picker -------------------------------------------
@@ -1472,6 +1979,27 @@ impl App {
                     self.status = "note updated".into();
                 }
             }
+            InputAction::AddAttachment(target) => {
+                let raw = value.trim();
+                if raw.is_empty() {
+                    self.status = "nothing added".into();
+                } else {
+                    let (val, label) = match raw.split_once('|') {
+                        Some((v, l)) => (v.trim().to_string(), l.trim().to_string()),
+                        None => (raw.to_string(), String::new()),
+                    };
+                    if let Some(list) = self.attachments_at_mut(target) {
+                        list.push(Attachment::new(val, label));
+                        self.dirty = true;
+                        self.status = "attachment added".into();
+                    }
+                }
+                let sel = self
+                    .attachments_at(target)
+                    .map(|list| list.len().saturating_sub(1))
+                    .unwrap_or(0);
+                self.mode = Mode::Attach(AttachState { target, sel });
+            }
             InputAction::AddTodo => {
                 let (title, priority, due) = parse_todo_input(&value);
                 if title.is_empty() {
@@ -1519,6 +2047,7 @@ impl App {
                 self.subtask_idx = len.saturating_sub(1);
                 self.dirty = true;
                 self.status = "subtask added".into();
+                self.sync_parent_done();
             }
             InputAction::EditSubtask(i) => {
                 let (title, priority) = parse_priority_input(&value);
@@ -1677,6 +2206,8 @@ impl App {
                 self.subtask_idx = self.subtask_idx.min(len.saturating_sub(1));
                 self.dirty = true;
                 self.status = "subtask deleted".into();
+                // Removing the last open subtask can complete the parent.
+                self.sync_parent_done();
             }
             ConfirmAction::DeleteNote(i) => {
                 if let Some(p) = self.current_project_mut()
@@ -1719,6 +2250,10 @@ impl App {
         self.subtask_idx = 0;
         self.note_idx = 0;
         self.note_scroll = 0;
+        self.todo_note_open = false;
+        self.sub_note_open = false;
+        self.todo_note_scroll = 0;
+        self.sub_note_scroll = 0;
         self.timeline_idx = 0;
     }
 
@@ -1799,6 +2334,8 @@ impl App {
                     let len = self.current_project().map(|p| p.todos.len()).unwrap_or(0);
                     self.todo_idx = step(self.todo_idx, delta, len);
                     self.subtask_idx = 0;
+                    self.todo_note_scroll = 0;
+                    self.sub_note_scroll = 0;
                 }
                 Tab::Notes => {
                     let len = self.current_project().map(|p| p.notes.len()).unwrap_or(0);
@@ -1823,6 +2360,7 @@ impl App {
                 _ => {
                     let len = self.current_todo().map(|t| t.subtasks.len()).unwrap_or(0);
                     self.subtask_idx = step(self.subtask_idx, delta, len);
+                    self.sub_note_scroll = 0;
                 }
             },
         }
@@ -1857,6 +2395,48 @@ fn row_at(pane: Rect, y: u16, len: usize) -> Option<usize> {
     }
     let idx = (y - first) as usize;
     (idx < len).then_some(idx)
+}
+
+/// Subsequence fuzzy match. `needle` and `haystack` must already be lowercased.
+/// `None` when `needle` isn't a subsequence of `haystack`; otherwise a score
+/// where higher is better (contiguous runs and early matches score more).
+fn fuzzy_score(needle: &str, haystack: &str) -> Option<i32> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    let hay: Vec<char> = haystack.chars().collect();
+    let mut hi = 0usize;
+    let mut score = 0i32;
+    let mut prev_match = false;
+    let mut first: Option<usize> = None;
+
+    for nc in needle.chars() {
+        let mut found = false;
+        while hi < hay.len() {
+            let hc = hay[hi];
+            hi += 1;
+            if hc == nc {
+                found = true;
+                first.get_or_insert(hi - 1);
+                score += 1;
+                if prev_match {
+                    score += 3;
+                }
+                prev_match = true;
+                break;
+            }
+            prev_match = false;
+        }
+        if !found {
+            return None;
+        }
+    }
+
+    if let Some(f) = first {
+        score += 10 - f.min(10) as i32;
+    }
+    score -= haystack.chars().count() as i32 / 20;
+    Some(score)
 }
 
 fn step(idx: usize, delta: i32, len: usize) -> usize {
@@ -2085,6 +2665,18 @@ mod tests {
         assert_eq!(title, "Beta");
         assert_eq!(date, NaiveDate::from_ymd_opt(2026, 6, 30).unwrap());
         assert!(parse_milestone_input("@2026-06-30", fallback).is_none());
+    }
+
+    #[test]
+    fn fuzzy_score_matches_subsequence_and_ranks() {
+        assert!(fuzzy_score("abc", "xyz").is_none());
+        assert!(fuzzy_score("abc", "aXbXc").is_some());
+        // Contiguous run outranks a scattered match.
+        let contiguous = fuzzy_score("side", "sidebar").unwrap();
+        let scattered = fuzzy_score("side", "s i d e where").unwrap();
+        assert!(contiguous > scattered);
+        // Empty needle always matches.
+        assert_eq!(fuzzy_score("", "anything"), Some(0));
     }
 
     #[test]

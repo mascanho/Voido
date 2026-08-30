@@ -221,17 +221,227 @@ const SOLARIZED_LIGHT: Palette = Palette {
     on_accent: rgb(0xfdf6e3),
 };
 
+const CATPPUCCIN_FRAPPE: Palette = Palette {
+    accent: rgb(0xca9ee6),
+    green: rgb(0xa6d189),
+    red: rgb(0xe78284),
+    yellow: rgb(0xe5c890),
+    blue: rgb(0x8caaee),
+    text: rgb(0xc6d0f5),
+    subtle: rgb(0x838ba7),
+    border: rgb(0x51576d),
+    sel_bg: rgb(0x414559),
+    bg: rgb(0x303446),
+    on_accent: rgb(0x303446),
+};
+
+const CATPPUCCIN_MACCHIATO: Palette = Palette {
+    accent: rgb(0xc6a0f6),
+    green: rgb(0xa6da95),
+    red: rgb(0xed8796),
+    yellow: rgb(0xeed49f),
+    blue: rgb(0x8aadf4),
+    text: rgb(0xcad3f5),
+    subtle: rgb(0x8087a2),
+    border: rgb(0x494d64),
+    sel_bg: rgb(0x363a4f),
+    bg: rgb(0x24273a),
+    on_accent: rgb(0x24273a),
+};
+
+const KANAGAWA: Palette = Palette {
+    accent: rgb(0x957fb8),
+    green: rgb(0x98bb6c),
+    red: rgb(0xe46876),
+    yellow: rgb(0xe6c384),
+    blue: rgb(0x7fb4ca),
+    text: rgb(0xdcd7ba),
+    subtle: rgb(0x727169),
+    border: rgb(0x54546d),
+    sel_bg: rgb(0x223249),
+    bg: rgb(0x1f1f28),
+    on_accent: rgb(0x1f1f28),
+};
+
+const ROSE_PINE_MOON: Palette = Palette {
+    accent: rgb(0xc4a7e7),
+    green: rgb(0x9ccfd8),
+    red: rgb(0xeb6f92),
+    yellow: rgb(0xf6c177),
+    blue: rgb(0x3e8fb0),
+    text: rgb(0xe0def4),
+    subtle: rgb(0x908caa),
+    border: rgb(0x44415a),
+    sel_bg: rgb(0x2a283e),
+    bg: rgb(0x232136),
+    on_accent: rgb(0x232136),
+};
+
+const ROSE_PINE_DAWN: Palette = Palette {
+    accent: rgb(0x907aa9),
+    green: rgb(0x56949f),
+    red: rgb(0xb4637a),
+    yellow: rgb(0xea9d34),
+    blue: rgb(0x286983),
+    text: rgb(0x575279),
+    subtle: rgb(0x9893a5),
+    border: rgb(0xdfdad9),
+    sel_bg: rgb(0xf4ede8),
+    bg: rgb(0xfaf4ed),
+    on_accent: rgb(0xfaf4ed),
+};
+
+const GRUVBOX_MATERIAL: Palette = Palette {
+    accent: rgb(0xe78a4e),
+    green: rgb(0xa9b665),
+    red: rgb(0xea6962),
+    yellow: rgb(0xd8a657),
+    blue: rgb(0x7daea3),
+    text: rgb(0xd4be98),
+    subtle: rgb(0x928374),
+    border: rgb(0x45403d),
+    sel_bg: rgb(0x3a3735),
+    bg: rgb(0x282828),
+    on_accent: rgb(0x282828),
+};
+
+const EVERFOREST_DARK: Palette = Palette {
+    accent: rgb(0x83c092),
+    green: rgb(0xa7c080),
+    red: rgb(0xe67e80),
+    yellow: rgb(0xdbbc7f),
+    blue: rgb(0x7fbbb3),
+    text: rgb(0xd3c6aa),
+    subtle: rgb(0x859289),
+    border: rgb(0x4f585e),
+    sel_bg: rgb(0x3d484d),
+    bg: rgb(0x2d353b),
+    on_accent: rgb(0x2d353b),
+};
+
+const EVERFOREST_LIGHT: Palette = Palette {
+    accent: rgb(0x35a77c),
+    green: rgb(0x8da101),
+    red: rgb(0xf85552),
+    yellow: rgb(0xdfa000),
+    blue: rgb(0x3a94c5),
+    text: rgb(0x5c6a72),
+    subtle: rgb(0x939f91),
+    border: rgb(0xe0dcc7),
+    sel_bg: rgb(0xefebd4),
+    bg: rgb(0xfdf6e3),
+    on_accent: rgb(0xfdf6e3),
+};
+
+const MONOKAI: Palette = Palette {
+    accent: rgb(0xae81ff),
+    green: rgb(0xa6e22e),
+    red: rgb(0xf92672),
+    yellow: rgb(0xe6db74),
+    blue: rgb(0x66d9ef),
+    text: rgb(0xf8f8f2),
+    subtle: rgb(0x75715e),
+    border: rgb(0x49483e),
+    sel_bg: rgb(0x3e3d32),
+    bg: rgb(0x272822),
+    on_accent: rgb(0x272822),
+};
+
+const AYU_DARK: Palette = Palette {
+    accent: rgb(0xff8f40),
+    green: rgb(0xaad94c),
+    red: rgb(0xf07178),
+    yellow: rgb(0xe6b450),
+    blue: rgb(0x59c2ff),
+    text: rgb(0xbfbdb6),
+    subtle: rgb(0x565b66),
+    border: rgb(0x131721),
+    sel_bg: rgb(0x1b2733),
+    bg: rgb(0x0d1017),
+    on_accent: rgb(0x0d1017),
+};
+
+const AYU_MIRAGE: Palette = Palette {
+    accent: rgb(0xffad66),
+    green: rgb(0xd5ff80),
+    red: rgb(0xf28779),
+    yellow: rgb(0xffd173),
+    blue: rgb(0x73d0ff),
+    text: rgb(0xcccac2),
+    subtle: rgb(0x707a8c),
+    border: rgb(0x171b24),
+    sel_bg: rgb(0x2d3640),
+    bg: rgb(0x1f2430),
+    on_accent: rgb(0x1f2430),
+};
+
+const GITHUB_DARK: Palette = Palette {
+    accent: rgb(0x58a6ff),
+    green: rgb(0x3fb950),
+    red: rgb(0xf85149),
+    yellow: rgb(0xd29922),
+    blue: rgb(0x58a6ff),
+    text: rgb(0xc9d1d9),
+    subtle: rgb(0x8b949e),
+    border: rgb(0x30363d),
+    sel_bg: rgb(0x21262d),
+    bg: rgb(0x0d1117),
+    on_accent: rgb(0x0d1117),
+};
+
+const GITHUB_LIGHT: Palette = Palette {
+    accent: rgb(0x0969da),
+    green: rgb(0x1a7f37),
+    red: rgb(0xcf222e),
+    yellow: rgb(0x9a6700),
+    blue: rgb(0x0969da),
+    text: rgb(0x1f2328),
+    subtle: rgb(0x656d76),
+    border: rgb(0xd0d7de),
+    sel_bg: rgb(0xeaeef2),
+    bg: rgb(0xffffff),
+    on_accent: rgb(0xffffff),
+};
+
+const ZENBURN: Palette = Palette {
+    accent: rgb(0xdfaf8f),
+    green: rgb(0x7f9f7f),
+    red: rgb(0xcc9393),
+    yellow: rgb(0xf0dfaf),
+    blue: rgb(0x8cd0d3),
+    text: rgb(0xdcdccc),
+    subtle: rgb(0x9f9f8f),
+    border: rgb(0x5f5f5f),
+    sel_bg: rgb(0x4f4f4f),
+    bg: rgb(0x3f3f3f),
+    on_accent: rgb(0x3f3f3f),
+};
+
 /// Built-ins, in picker order. The first is the default.
 const BUILTINS: &[(&str, &str, Palette)] = &[
     ("catppuccin-mocha", "Catppuccin Mocha", CATPPUCCIN_MOCHA),
+    ("catppuccin-macchiato", "Catppuccin Macchiato", CATPPUCCIN_MACCHIATO),
+    ("catppuccin-frappe", "Catppuccin Frappé", CATPPUCCIN_FRAPPE),
     ("catppuccin-latte", "Catppuccin Latte", CATPPUCCIN_LATTE),
     ("tokyo-night", "Tokyo Night", TOKYO_NIGHT),
+    ("kanagawa", "Kanagawa", KANAGAWA),
     ("dracula", "Dracula", DRACULA),
     ("nord", "Nord", NORD),
-    ("gruvbox-dark", "Gruvbox Dark", GRUVBOX_DARK),
-    ("gruvbox-light", "Gruvbox Light", GRUVBOX_LIGHT),
-    ("one-dark", "One Dark", ONE_DARK),
     ("rose-pine", "Rosé Pine", ROSE_PINE),
+    ("rose-pine-moon", "Rosé Pine Moon", ROSE_PINE_MOON),
+    ("rose-pine-dawn", "Rosé Pine Dawn", ROSE_PINE_DAWN),
+    ("gruvbox-dark", "Gruvbox Dark", GRUVBOX_DARK),
+    ("gruvbox-material", "Gruvbox Material", GRUVBOX_MATERIAL),
+    ("gruvbox-light", "Gruvbox Light", GRUVBOX_LIGHT),
+    ("everforest-dark", "Everforest Dark", EVERFOREST_DARK),
+    ("everforest-light", "Everforest Light", EVERFOREST_LIGHT),
+    ("one-dark", "One Dark", ONE_DARK),
+    ("monokai", "Monokai", MONOKAI),
+    ("ayu-dark", "Ayu Dark", AYU_DARK),
+    ("ayu-mirage", "Ayu Mirage", AYU_MIRAGE),
+    ("github-dark", "GitHub Dark", GITHUB_DARK),
+    ("github-light", "GitHub Light", GITHUB_LIGHT),
+    ("zenburn", "Zenburn", ZENBURN),
     ("solarized-dark", "Solarized Dark", SOLARIZED_DARK),
     ("solarized-light", "Solarized Light", SOLARIZED_LIGHT),
 ];

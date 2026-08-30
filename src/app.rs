@@ -119,6 +119,8 @@ pub enum InputAction {
     EditNote(usize),
     /// Add an attachment to this target; returns to the manager afterwards.
     AddAttachment(AttachTarget),
+    /// Add one or more (space-separated) tags to this target.
+    AddTag(TagTarget),
     AddMilestone,
     EditMilestone(usize),
     RescheduleTodo(usize),
@@ -196,6 +198,20 @@ pub struct AttachState {
     pub sel: usize,
 }
 
+/// What a set of tags hangs off. Indices are captured when the manager opens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TagTarget {
+    Project,
+    Todo(usize),
+    Subtask { todo: usize, sub: usize },
+}
+
+/// The tag manager overlay.
+pub struct TagState {
+    pub target: TagTarget,
+    pub sel: usize,
+}
+
 /// The fuzzy-finder overlay.
 pub struct SearchState {
     pub editor: TextArea<'static>,
@@ -213,7 +229,19 @@ impl SearchState {
 pub enum SearchTarget {
     Project,
     Todo(usize),
+    Subtask { todo: usize, sub: usize },
     Note(usize),
+}
+
+impl SearchTarget {
+    /// Nesting depth: project 0, todo/note 1, subtask 2.
+    pub fn depth(self) -> usize {
+        match self {
+            SearchTarget::Project => 0,
+            SearchTarget::Todo(_) | SearchTarget::Note(_) => 1,
+            SearchTarget::Subtask { .. } => 2,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -221,7 +249,9 @@ pub struct SearchHit {
     pub project_idx: usize,
     pub target: SearchTarget,
     pub label: String,
-    pub context: String,
+    /// Ancestor names, outermost first — `[]` for a project, `[project]` for a
+    /// todo/note, `[project, todo]` for a subtask.
+    pub crumbs: Vec<String>,
 }
 
 /// Theme picker. Moving the cursor previews the theme live; `esc` restores the
@@ -233,24 +263,20 @@ pub struct ThemeState {
     pub saved: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HelpTab {
-    General,
-    Main,
-}
-
 pub enum Mode {
     Normal,
     Input(Box<InputState>),
     Confirm(ConfirmState),
     EditBody(Box<EditState>),
-    Help(HelpTab),
+    Help,
     GitHub,
     Theme(ThemeState),
     /// A dismissible message popup — (title, body). Used for sync results.
     Notice(String, String),
     /// Attachment manager for the current todo.
     Attach(AttachState),
+    /// Tag manager for the current project / todo / subtask.
+    Tags(TagState),
     /// Global fuzzy finder.
     Search(Box<SearchState>),
 }
@@ -272,7 +298,12 @@ pub struct App {
     pub sub_note_open: bool,
     pub todo_note_scroll: u16,
     pub sub_note_scroll: u16,
+    /// `i` toggles an inline detail panel (tags, dates, counts…) under the
+    /// selected row — a separate flag per pane so expanding todos doesn't also
+    /// expand the projects rail.
     pub project_info: bool,
+    pub todo_info: bool,
+    pub subtask_info: bool,
     /// `m` toggles a stripped-back layout (no hint bar, minimal header).
     pub minimal: bool,
     pub timeline_idx: usize,
@@ -327,11 +358,17 @@ impl App {
         sync_sha: Option<String>,
         sync_token: Option<String>,
     ) -> Self {
-        // Enforce the "todo with subtasks is done iff they all are" invariant on
-        // whatever we loaded (local DB, legacy import or GitHub sync).
+        // Tidy whatever we loaded (local DB, legacy import or GitHub sync):
+        // enforce "todo with subtasks is done iff they all are", and normalise
+        // any hand-edited tags.
         for p in &mut store.projects {
+            p.tags = crate::model::normalize_tags(p.tags.drain(..));
             for t in &mut p.todos {
                 t.recompute_done();
+                t.tags = crate::model::normalize_tags(t.tags.drain(..));
+                for s in &mut t.subtasks {
+                    s.tags = crate::model::normalize_tags(s.tags.drain(..));
+                }
             }
         }
         let gh_client = GitHubClient::new(sync_token.clone());
@@ -350,6 +387,8 @@ impl App {
             sub_note_scroll: 0,
             note_expanded: false,
             project_info: false,
+            todo_info: false,
+            subtask_info: false,
             minimal: false,
             timeline_idx: 0,
             deadline_filter: DeadlineFilter::All,
@@ -827,17 +866,9 @@ impl App {
             Mode::EditBody(_) => self.handle_edit_body(key),
             Mode::Theme(_) => self.handle_theme(key),
             Mode::Attach(_) => self.handle_attach(key),
+            Mode::Tags(_) => self.handle_tags(key),
             Mode::Search(_) => self.handle_search(key),
-            Mode::Help(_) => match key.code {
-                KeyCode::Left | KeyCode::Char('h') => {
-                    self.mode = Mode::Help(HelpTab::General);
-                }
-                KeyCode::Right | KeyCode::Char('l') => {
-                    self.mode = Mode::Help(HelpTab::Main);
-                }
-                _ => self.mode = Mode::Normal,
-            },
-            Mode::GitHub | Mode::Notice(..) => self.mode = Mode::Normal,
+            Mode::Help | Mode::GitHub | Mode::Notice(..) => self.mode = Mode::Normal,
         }
     }
 
@@ -972,7 +1003,7 @@ impl App {
 
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
-            KeyCode::Char('?') => self.mode = Mode::Help(HelpTab::General),
+            KeyCode::Char('?') => self.mode = Mode::Help,
             KeyCode::Char('/') => self.open_search(),
             KeyCode::Char('m') => {
                 self.minimal = !self.minimal;
@@ -1032,13 +1063,15 @@ impl App {
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => self.move_sel(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_sel(-1),
-            KeyCode::Char('a') => {
-                self.begin_input("New project", String::new(), InputAction::AddProject)
-            }
+            KeyCode::Char('a') => self.begin_input(
+                "New project   (#tag for tags)",
+                String::new(),
+                InputAction::AddProject,
+            ),
             KeyCode::Char('r') => {
                 if let Some(p) = self.current_project() {
-                    let name = p.name.clone();
-                    self.begin_input("Rename project", name, InputAction::RenameProject);
+                    let pre = project_edit_string(p);
+                    self.begin_input("Rename project   (#tag)", pre, InputAction::RenameProject);
                 }
             }
             KeyCode::Char('d') => {
@@ -1052,9 +1085,8 @@ impl App {
                 }
             }
             KeyCode::Char('o') => self.show_github(),
-            KeyCode::Char('i') => {
-                self.project_info = !self.project_info;
-            }
+            KeyCode::Char('t') => self.open_tags(),
+            KeyCode::Char('i') => self.project_info = !self.project_info,
             KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => {
                 if !self.store.projects.is_empty() {
                     self.focus = Focus::Content;
@@ -1082,7 +1114,7 @@ impl App {
             KeyCode::Char('a') => {
                 if self.current_project().is_some() {
                     self.begin_input(
-                        "New todo   (!1..!3 priority · @YYYY-MM-DD due)",
+                        "New todo   (!1..!3 · @YYYY-MM-DD · #tag)",
                         String::new(),
                         InputAction::AddTodo,
                     );
@@ -1135,6 +1167,8 @@ impl App {
             KeyCode::Char('o') => self.sort_todos_by_priority(),
             KeyCode::Char('N') => self.begin_edit_todo_note(),
             KeyCode::Char('A') => self.open_attachments(),
+            KeyCode::Char('t') => self.open_tags(),
+            KeyCode::Char('i') => self.todo_info = !self.todo_info,
             _ => {}
         }
     }
@@ -1187,7 +1221,7 @@ impl App {
             KeyCode::Char('a') => {
                 if self.current_todo().is_some() {
                     self.begin_input(
-                        "New subtask   (!1..!3 priority)",
+                        "New subtask   (!1..!3 · #tag)",
                         String::new(),
                         InputAction::AddSubtask,
                     );
@@ -1235,6 +1269,8 @@ impl App {
             KeyCode::Char('K') => self.reorder_subtask(-1),
             KeyCode::Char('N') => self.begin_edit_subtask_note(),
             KeyCode::Char('A') => self.open_subtask_attachments(),
+            KeyCode::Char('t') => self.open_tags(),
+            KeyCode::Char('i') => self.subtask_info = !self.subtask_info,
             _ => {}
         }
     }
@@ -1269,10 +1305,11 @@ impl App {
             }
             KeyCode::Char('r') => {
                 if let Some(p) = self.current_project() {
-                    let name = p.name.clone();
-                    self.begin_input("Rename project", name, InputAction::RenameProject);
+                    let pre = project_edit_string(p);
+                    self.begin_input("Rename project   (#tag)", pre, InputAction::RenameProject);
                 }
             }
+            KeyCode::Char('t') => self.open_tags(),
             _ => {}
         }
     }
@@ -1597,6 +1634,98 @@ impl App {
         }
     }
 
+    // ---- tags -------------------------------------------------
+
+    /// `t` opens the tag manager for whatever's under the cursor.
+    fn open_tags(&mut self) {
+        let target = match self.focus {
+            Focus::Projects => Some(TagTarget::Project),
+            Focus::Content if self.tab == Tab::Overview => Some(TagTarget::Project),
+            Focus::Content if self.tab == Tab::Todos && self.current_todo().is_some() => {
+                Some(TagTarget::Todo(self.todo_idx))
+            }
+            Focus::Detail
+                if self.tab == Tab::Todos
+                    && self
+                        .current_todo()
+                        .is_some_and(|t| self.subtask_idx < t.subtasks.len()) =>
+            {
+                Some(TagTarget::Subtask {
+                    todo: self.todo_idx,
+                    sub: self.subtask_idx,
+                })
+            }
+            _ => None,
+        };
+        match target {
+            Some(t) => self.mode = Mode::Tags(TagState { target: t, sel: 0 }),
+            None => self.status = "nothing here to tag".into(),
+        }
+    }
+
+    pub fn tags_at(&self, t: TagTarget) -> Option<&Vec<String>> {
+        let p = self.current_project()?;
+        match t {
+            TagTarget::Project => Some(&p.tags),
+            TagTarget::Todo(i) => p.todos.get(i).map(|t| &t.tags),
+            TagTarget::Subtask { todo, sub } => {
+                p.todos.get(todo).and_then(|t| t.subtasks.get(sub)).map(|s| &s.tags)
+            }
+        }
+    }
+
+    fn tags_at_mut(&mut self, t: TagTarget) -> Option<&mut Vec<String>> {
+        let p = self.current_project_mut()?;
+        match t {
+            TagTarget::Project => Some(&mut p.tags),
+            TagTarget::Todo(i) => p.todos.get_mut(i).map(|t| &mut t.tags),
+            TagTarget::Subtask { todo, sub } => p
+                .todos
+                .get_mut(todo)
+                .and_then(|t| t.subtasks.get_mut(sub))
+                .map(|s| &mut s.tags),
+        }
+    }
+
+    fn handle_tags(&mut self, key: KeyEvent) {
+        let Mode::Tags(state) = &self.mode else {
+            return;
+        };
+        let (target, sel) = (state.target, state.sel);
+        let len = self.tags_at(target).map(Vec::len).unwrap_or(0);
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('h') => self.mode = Mode::Normal,
+            KeyCode::Char('j') | KeyCode::Down => {
+                if let Mode::Tags(s) = &mut self.mode {
+                    s.sel = step(sel, 1, len);
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if let Mode::Tags(s) = &mut self.mode {
+                    s.sel = step(sel, -1, len);
+                }
+            }
+            KeyCode::Char('a') => self.begin_input(
+                "Add tags   (space-separated · # optional)",
+                String::new(),
+                InputAction::AddTag(target),
+            ),
+            KeyCode::Char('d') => {
+                if let Some(list) = self.tags_at_mut(target)
+                    && sel < list.len()
+                {
+                    let removed = list.remove(sel);
+                    self.dirty = true;
+                    self.status = format!("removed #{removed}");
+                }
+                if let Mode::Tags(s) = &mut self.mode {
+                    s.sel = s.sel.min(len.saturating_sub(2));
+                }
+            }
+            _ => {}
+        }
+    }
+
     // ---- fuzzy finder -----------------------------------------
 
     fn open_search(&mut self) {
@@ -1614,33 +1743,61 @@ impl App {
         };
         let mut scored: Vec<(i32, usize, SearchHit)> = Vec::new();
         for (pi, p) in self.store.projects.iter().enumerate() {
-            let consider =
-                |cand: &str, target: SearchTarget, context: &str, out: &mut Vec<(i32, usize, SearchHit)>| {
-                    let score = if q.is_empty() {
-                        Some(0)
-                    } else {
-                        fuzzy_score(&q, &cand.to_lowercase())
-                    };
-                    if let Some(score) = score {
-                        let order = out.len();
-                        out.push((
-                            score,
-                            order,
-                            SearchHit {
-                                project_idx: pi,
-                                target,
-                                label: cand.to_string(),
-                                context: context.to_string(),
-                            },
-                        ));
-                    }
+            // `hay` is matched against; `label` is what the result shows; `crumbs`
+            // are the ancestor names. Tags fold into the haystack.
+            let mut consider = |label: &str, hay: &str, target: SearchTarget, crumbs: Vec<String>| {
+                let score = if q.is_empty() {
+                    Some(0)
+                } else {
+                    fuzzy_score(&q, &hay.to_lowercase())
                 };
-            consider(&p.name, SearchTarget::Project, "project", &mut scored);
+                if let Some(score) = score {
+                    let order = scored.len();
+                    scored.push((
+                        score,
+                        order,
+                        SearchHit {
+                            project_idx: pi,
+                            target,
+                            label: label.to_string(),
+                            crumbs,
+                        },
+                    ));
+                }
+            };
+            let with_tags = |base: &str, tags: &[String]| {
+                if tags.is_empty() {
+                    base.to_string()
+                } else {
+                    format!("{base} {}", tags.join(" "))
+                }
+            };
+            consider(
+                &p.name,
+                &with_tags(&p.name, &p.tags),
+                SearchTarget::Project,
+                vec![],
+            );
             for (ti, t) in p.todos.iter().enumerate() {
-                consider(&t.title, SearchTarget::Todo(ti), &p.name, &mut scored);
+                consider(
+                    &t.title,
+                    &with_tags(&t.title, &t.tags),
+                    SearchTarget::Todo(ti),
+                    vec![p.name.clone()],
+                );
+                if !q.is_empty() {
+                    for (si, s) in t.subtasks.iter().enumerate() {
+                        consider(
+                            &s.title,
+                            &with_tags(&s.title, &s.tags),
+                            SearchTarget::Subtask { todo: ti, sub: si },
+                            vec![p.name.clone(), t.title.clone()],
+                        );
+                    }
+                }
             }
             for (ni, n) in p.notes.iter().enumerate() {
-                consider(&n.text, SearchTarget::Note(ni), &p.name, &mut scored);
+                consider(&n.text, &n.text, SearchTarget::Note(ni), vec![p.name.clone()]);
             }
         }
         // Highest score first; stable on insertion order for ties / empty query.
@@ -1674,6 +1831,12 @@ impl App {
                 self.todo_idx = i;
                 self.subtask_idx = 0;
                 self.focus = Focus::Content;
+            }
+            SearchTarget::Subtask { todo, sub } => {
+                self.tab = Tab::Todos;
+                self.todo_idx = todo;
+                self.subtask_idx = sub;
+                self.focus = Focus::Detail;
             }
             SearchTarget::Note(i) => {
                 self.tab = Tab::Notes;
@@ -1919,12 +2082,14 @@ impl App {
         let value = input.value();
         match input.action {
             InputAction::AddProject => {
-                let name = value.trim();
+                let (name, tags) = parse_tagged_name(&value);
                 if name.is_empty() {
                     self.status = "nothing added".into();
                     return;
                 }
-                self.store.projects.push(Project::new(name));
+                let mut project = Project::new(&name);
+                project.tags = tags;
+                self.store.projects.push(project);
                 self.project_idx = self.store.projects.len() - 1;
                 self.focus = Focus::Content;
                 self.tab = Tab::Todos;
@@ -1933,12 +2098,13 @@ impl App {
                 self.status = format!("added project: {name}");
             }
             InputAction::RenameProject => {
-                let name = value.trim().to_string();
+                let (name, tags) = parse_tagged_name(&value);
                 if name.is_empty() {
                     return;
                 }
                 if let Some(p) = self.current_project_mut() {
                     p.name = name.clone();
+                    p.tags = tags;
                 }
                 self.dirty = true;
                 self.status = format!("renamed to: {name}");
@@ -2000,8 +2166,33 @@ impl App {
                     .unwrap_or(0);
                 self.mode = Mode::Attach(AttachState { target, sel });
             }
+            InputAction::AddTag(target) => {
+                let new = crate::model::normalize_tags(value.split_whitespace());
+                if new.is_empty() {
+                    self.status = "no tags added".into();
+                } else if let Some(list) = self.tags_at_mut(target) {
+                    let before = list.len();
+                    for t in new {
+                        if !list.contains(&t) {
+                            list.push(t);
+                        }
+                    }
+                    let added = list.len() - before;
+                    self.dirty = true;
+                    self.status = match added {
+                        0 => "already tagged".into(),
+                        1 => "tag added".into(),
+                        n => format!("{n} tags added"),
+                    };
+                }
+                let sel = self
+                    .tags_at(target)
+                    .map(|list| list.len().saturating_sub(1))
+                    .unwrap_or(0);
+                self.mode = Mode::Tags(TagState { target, sel });
+            }
             InputAction::AddTodo => {
-                let (title, priority, due) = parse_todo_input(&value);
+                let (title, priority, due, tags) = parse_todo_input(&value);
                 if title.is_empty() {
                     self.status = "nothing added".into();
                     return;
@@ -2010,6 +2201,7 @@ impl App {
                     let mut todo = Todo::new(title);
                     todo.priority = priority;
                     todo.due = due;
+                    todo.tags = tags;
                     p.todos.push(todo);
                 }
                 let len = self.current_project().map(|p| p.todos.len()).unwrap_or(0);
@@ -2019,7 +2211,7 @@ impl App {
                 self.status = "todo added".into();
             }
             InputAction::EditTodo(i) => {
-                let (title, priority, due) = parse_todo_input(&value);
+                let (title, priority, due, tags) = parse_todo_input(&value);
                 if title.is_empty() {
                     return;
                 }
@@ -2027,12 +2219,13 @@ impl App {
                     t.title = title;
                     t.priority = priority;
                     t.due = due;
+                    t.tags = tags;
                     self.dirty = true;
                     self.status = "todo updated".into();
                 }
             }
             InputAction::AddSubtask => {
-                let (title, priority) = parse_priority_input(&value);
+                let (title, priority, tags) = parse_priority_input(&value);
                 if title.is_empty() {
                     self.status = "nothing added".into();
                     return;
@@ -2041,6 +2234,7 @@ impl App {
                 if let Some(t) = self.current_todo_mut() {
                     let mut sub = Subtask::new(title, false);
                     sub.priority = priority;
+                    sub.tags = tags;
                     t.subtasks.push(sub);
                     len = t.subtasks.len();
                 }
@@ -2050,13 +2244,14 @@ impl App {
                 self.sync_parent_done();
             }
             InputAction::EditSubtask(i) => {
-                let (title, priority) = parse_priority_input(&value);
+                let (title, priority, tags) = parse_priority_input(&value);
                 if title.is_empty() {
                     return;
                 }
                 if let Some(s) = self.current_todo_mut().and_then(|t| t.subtasks.get_mut(i)) {
                     s.title = title;
                     s.priority = priority;
+                    s.tags = tags;
                     self.dirty = true;
                     self.status = "subtask updated".into();
                 }
@@ -2447,10 +2642,18 @@ fn step(idx: usize, delta: i32, len: usize) -> usize {
     (idx as i32 + delta).clamp(0, max) as usize
 }
 
-/// Parse `buy milk !3 @2026-09-01` into (title, priority, due).
-fn parse_todo_input(raw: &str) -> (String, Priority, Option<NaiveDate>) {
+/// A `#tag` token: `#` followed by a letter (so issue refs like `#42` stay in
+/// the title). The tag body is cleaned later by `model::normalize_tag`.
+fn is_tag_token(tok: &str) -> bool {
+    let mut c = tok.chars();
+    c.next() == Some('#') && c.next().is_some_and(|c| c.is_ascii_alphabetic())
+}
+
+/// Parse `buy milk !3 @2026-09-01 #chores` into (title, priority, due, tags).
+fn parse_todo_input(raw: &str) -> (String, Priority, Option<NaiveDate>, Vec<String>) {
     let mut priority = Priority::Medium;
     let mut due = None;
+    let mut tags: Vec<&str> = Vec::new();
     let mut words = Vec::new();
 
     for tok in raw.split_whitespace() {
@@ -2458,6 +2661,10 @@ fn parse_todo_input(raw: &str) -> (String, Priority, Option<NaiveDate>) {
             && let Ok(d) = NaiveDate::parse_from_str(rest, "%Y-%m-%d")
         {
             due = Some(d);
+            continue;
+        }
+        if is_tag_token(tok) {
+            tags.push(tok);
             continue;
         }
         match tok {
@@ -2478,7 +2685,12 @@ fn parse_todo_input(raw: &str) -> (String, Priority, Option<NaiveDate>) {
         words.push(tok);
     }
 
-    (words.join(" ").trim().to_string(), priority, due)
+    (
+        words.join(" ").trim().to_string(),
+        priority,
+        due,
+        crate::model::normalize_tags(tags),
+    )
 }
 
 /// Parse `Launch v1 @2026-09-15` into (title, date), defaulting to `fallback`.
@@ -2507,12 +2719,18 @@ fn parse_milestone_input(raw: &str, fallback: NaiveDate) -> Option<(String, Naiv
     }
 }
 
-/// Parse `refactor auth !3` into (title, priority). `!1`/`!2`/`!3` (also
-/// `!low`/`!med`/`!high`, `!!`) set the priority and drop out of the title.
-fn parse_priority_input(raw: &str) -> (String, Priority) {
+/// Parse `refactor auth !3 #api` into (title, priority, tags). `!1`/`!2`/`!3`
+/// (also `!low`/`!med`/`!high`, `!!`) set the priority; `#tag` tokens are tags;
+/// both drop out of the title.
+fn parse_priority_input(raw: &str) -> (String, Priority, Vec<String>) {
     let mut priority = Priority::Medium;
+    let mut tags: Vec<&str> = Vec::new();
     let mut words = Vec::new();
     for tok in raw.split_whitespace() {
+        if is_tag_token(tok) {
+            tags.push(tok);
+            continue;
+        }
         match tok {
             "!1" | "!low" => priority = Priority::Low,
             "!2" | "!med" | "!medium" => priority = Priority::Medium,
@@ -2520,7 +2738,28 @@ fn parse_priority_input(raw: &str) -> (String, Priority) {
             _ => words.push(tok),
         }
     }
-    (words.join(" ").trim().to_string(), priority)
+    (
+        words.join(" ").trim().to_string(),
+        priority,
+        crate::model::normalize_tags(tags),
+    )
+}
+
+/// Parse a project name line, pulling out `#tag` tokens: `Website #web #api`.
+fn parse_tagged_name(raw: &str) -> (String, Vec<String>) {
+    let mut tags: Vec<&str> = Vec::new();
+    let mut words = Vec::new();
+    for tok in raw.split_whitespace() {
+        if is_tag_token(tok) {
+            tags.push(tok);
+        } else {
+            words.push(tok);
+        }
+    }
+    (
+        words.join(" ").trim().to_string(),
+        crate::model::normalize_tags(tags),
+    )
 }
 
 /// `!1` for low, `!3` for high — the suffix `parse_priority_input` understands.
@@ -2532,8 +2771,18 @@ fn priority_suffix(p: Priority) -> &'static str {
     }
 }
 
+/// ` #tag #tag2` — the suffix the input parsers round-trip.
+fn tags_suffix(tags: &[String]) -> String {
+    tags.iter().map(|t| format!(" #{t}")).collect()
+}
+
 fn subtask_edit_string(s: &Subtask) -> String {
-    format!("{}{}", s.title, priority_suffix(s.priority))
+    format!(
+        "{}{}{}",
+        s.title,
+        priority_suffix(s.priority),
+        tags_suffix(&s.tags)
+    )
 }
 
 fn todo_edit_string(t: &Todo) -> String {
@@ -2542,7 +2791,12 @@ fn todo_edit_string(t: &Todo) -> String {
     if let Some(d) = t.due {
         s.push_str(&format!(" @{}", d.format("%Y-%m-%d")));
     }
+    s.push_str(&tags_suffix(&t.tags));
     s
+}
+
+fn project_edit_string(p: &Project) -> String {
+    format!("{}{}", p.name, tags_suffix(&p.tags))
 }
 
 fn milestone_edit_string(m: &Milestone) -> String {
@@ -2607,47 +2861,59 @@ mod tests {
 
     #[test]
     fn parse_todo_extracts_priority_and_due() {
-        let (title, prio, due) = parse_todo_input("ship the release !3 @2026-09-15");
+        let (title, prio, due, tags) = parse_todo_input("ship the release !3 @2026-09-15 #rel");
         assert_eq!(title, "ship the release");
         assert_eq!(prio, Priority::High);
         assert_eq!(due, NaiveDate::from_ymd_opt(2026, 9, 15));
+        assert_eq!(tags, vec!["rel"]);
     }
 
     #[test]
     fn parse_todo_defaults_and_aliases() {
-        let (title, prio, due) = parse_todo_input("plain task");
+        let (title, prio, due, tags) = parse_todo_input("plain task");
         assert_eq!(title, "plain task");
         assert_eq!(prio, Priority::Medium);
         assert_eq!(due, None);
+        assert!(tags.is_empty());
 
-        let (_, prio, _) = parse_todo_input("do it !low");
+        let (.., prio, _, _) = parse_todo_input("do it !low");
         assert_eq!(prio, Priority::Low);
-        let (_, prio, _) = parse_todo_input("do it !!");
+        let (.., prio, _, _) = parse_todo_input("do it !!");
         assert_eq!(prio, Priority::High);
     }
 
     #[test]
     fn parse_todo_keeps_invalid_date_token() {
-        let (title, _, due) = parse_todo_input("mail @someone about it");
+        let (title, _, due, _) = parse_todo_input("mail @someone about it");
         assert_eq!(title, "mail @someone about it");
         assert_eq!(due, None);
     }
 
     #[test]
+    fn parse_todo_tags_vs_issue_refs() {
+        let (title, _, _, tags) = parse_todo_input("fix login #42 #auth-bug");
+        assert_eq!(title, "fix login #42", "#42 is not a tag");
+        assert_eq!(tags, vec!["auth-bug"]);
+    }
+
+    #[test]
     fn subtask_priority_parses_and_roundtrips() {
-        let (title, prio) = parse_priority_input("wire up the API !3");
+        let (title, prio, _) = parse_priority_input("wire up the API !3");
         assert_eq!(title, "wire up the API");
         assert_eq!(prio, Priority::High);
 
-        let (title, prio) = parse_priority_input("just a note");
+        let (title, prio, tags) = parse_priority_input("just a note #x #y #x");
         assert_eq!(title, "just a note");
         assert_eq!(prio, Priority::Medium);
+        assert_eq!(tags, vec!["x", "y"], "cleaned + de-duped");
 
         let mut s = Subtask::new("polish copy", false);
         s.priority = Priority::Low;
-        let (title, prio) = parse_priority_input(&subtask_edit_string(&s));
+        s.tags = vec!["ui".into()];
+        let (title, prio, tags) = parse_priority_input(&subtask_edit_string(&s));
         assert_eq!(title, "polish copy");
         assert_eq!(prio, Priority::Low);
+        assert_eq!(tags, vec!["ui"]);
     }
 
     #[test]
@@ -2684,9 +2950,26 @@ mod tests {
         let mut t = Todo::new("write docs");
         t.priority = Priority::High;
         t.due = NaiveDate::from_ymd_opt(2026, 3, 4);
-        let (title, prio, due) = parse_todo_input(&todo_edit_string(&t));
+        t.tags = vec!["docs".into(), "q3".into()];
+        let (title, prio, due, tags) = parse_todo_input(&todo_edit_string(&t));
         assert_eq!(title, "write docs");
         assert_eq!(prio, Priority::High);
         assert_eq!(due, t.due);
+        assert_eq!(tags, t.tags);
+    }
+
+    #[test]
+    fn search_target_depth() {
+        assert_eq!(SearchTarget::Project.depth(), 0);
+        assert_eq!(SearchTarget::Todo(0).depth(), 1);
+        assert_eq!(SearchTarget::Note(0).depth(), 1);
+        assert_eq!(SearchTarget::Subtask { todo: 0, sub: 0 }.depth(), 2);
+    }
+
+    #[test]
+    fn parse_tagged_name_splits_project_tags() {
+        let (name, tags) = parse_tagged_name("Website Redesign #web #Frontend");
+        assert_eq!(name, "Website Redesign");
+        assert_eq!(tags, vec!["web", "frontend"]);
     }
 }

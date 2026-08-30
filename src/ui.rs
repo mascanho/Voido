@@ -12,13 +12,12 @@ use ratatui::{
 };
 
 use crate::app::{
-    App, AttachState, ConfirmState, DetailNote, EditTarget, Focus, HelpTab, InputState, Mode,
-    PaneRects, SearchState, SearchTarget, Tab, ThemeState, TimelineEntry, TlKind,
+    App, AttachState, ConfirmState, DetailNote, EditTarget, Focus, InputState, Mode, PaneRects,
+    SearchState, SearchTarget, Tab, TagState, TagTarget, ThemeState, TlKind,
 };
 use crate::model::{AttachmentKind, Priority};
 use crate::theme::{accent, bg, blue, border, green, on_accent, red, sel_bg, subtle, text, yellow};
 use crate::util::truncate;
-use unicode_width::UnicodeWidthChar;
 
 pub fn render(f: &mut Frame, app: &App) {
     let area = f.area();
@@ -98,11 +97,12 @@ pub fn render(f: &mut Frame, app: &App) {
     match &app.mode {
         Mode::Input(input) => render_input(f, area, input),
         Mode::Confirm(c) => render_confirm(f, area, c),
-        Mode::Help(tab) => render_help(f, area, *tab),
+        Mode::Help => render_help(f, area),
         Mode::GitHub => render_github(f, area, app),
         Mode::Theme(state) => render_theme(f, area, state),
         Mode::Notice(title, body) => render_notice(f, area, title, body),
         Mode::Attach(state) => render_attach(f, area, state, app),
+        Mode::Tags(state) => render_tags(f, area, state, app),
         Mode::Search(state) => render_search(f, area, state, app),
         Mode::EditBody(_) => {}
         Mode::Normal => {}
@@ -165,51 +165,26 @@ fn render_projects(f: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    let pane_w = area.width as usize;
-    let icon_w = 2;
-    let dw = |s: &str| s.chars().map(|c| c.width().unwrap_or(1)).sum::<usize>();
-    let center = |val: &str, w: usize| {
-        let vd = dw(val);
-        if vd >= w {
-            val.chars().take(w.saturating_sub(1)).collect::<String>() + "…"
-        } else {
-            let l = (w - vd) / 2;
-            let r = w - vd - l;
-            format!("{}{}{}", " ".repeat(l), val, " ".repeat(r))
-        }
-    };
+    let inner_w = list_inner_w(area);
 
-    struct Row<'a> {
-        dot: Span<'a>,
-        name: String,
-        name_style: Style,
-        tasks: String,
-        tasks_style: Style,
-        subs: String,
-        subs_style: Style,
-        notes: String,
-        notes_style: Style,
-    }
-
-    // One distinct icon per project; colour still carries the status.
+    // One distinct icon per project; colour carries the status.
     let icons = crate::util::project_icons(app.store.projects.iter().map(|p| p.name.as_str()));
 
-    let raw: Vec<Row<'_>> = app
+    let specs: Vec<RowSpec> = app
         .store
         .projects
         .iter()
         .enumerate()
-        .map(|(pi, p)| {
+        .map(|(i, p)| {
             let open = p.open_todos();
             let total = p.todos.len();
-            let is_empty =
-                p.todos.is_empty() && p.milestones.is_empty() && p.notes.is_empty();
-            let (icon_color, name_style) = if p.is_complete() {
+            let complete = p.is_complete();
+            let is_empty = total == 0 && p.milestones.is_empty() && p.notes.is_empty();
+
+            let (icon_color, name_style) = if complete {
                 (
                     green(),
-                    Style::new()
-                        .fg(subtle())
-                        .add_modifier(Modifier::CROSSED_OUT),
+                    Style::new().fg(subtle()).add_modifier(Modifier::CROSSED_OUT),
                 )
             } else if is_empty {
                 (subtle(), Style::new().fg(subtle()))
@@ -218,124 +193,107 @@ fn render_projects(f: &mut Frame, area: Rect, app: &App) {
             } else {
                 (accent(), Style::new().fg(text()))
             };
-            let dot = Span::styled(
-                format!("{} ", icons[pi]),
-                Style::new().fg(icon_color),
-            );
 
-            let (tasks, tasks_s) = if total > 0 {
-                let d = p.done_todos();
-                let s = format!("{d}/{total}");
-                let c = if d == total {
-                    Style::new().fg(green())
-                } else {
-                    Style::new().fg(subtle())
-                };
-                (s, c)
+            let tally = if complete {
+                ("✓".to_string(), Style::new().fg(green()))
+            } else if total == 0 {
+                ("·".to_string(), Style::new().fg(border()))
+            } else if open == 0 {
+                (format!("{total}/{total}"), Style::new().fg(green()))
             } else {
-                ("-".into(), Style::new().fg(subtle()))
+                (format!("{}/{total}", total - open), Style::new().fg(subtle()))
             };
 
-            let (sd, st) = p.subtask_progress();
-            let (subs, subs_s) = if st > 0 {
-                let s = format!("{sd}/{st}");
-                let c = if sd == st {
-                    Style::new().fg(green())
-                } else {
-                    Style::new().fg(subtle())
-                };
-                (s, c)
-            } else {
-                ("-".into(), Style::new().fg(subtle()))
-            };
-
-            let nc = p.note_count();
-            let notes = if nc > 0 {
-                format!("{nc}")
-            } else {
-                "-".into()
-            };
-
-            Row { dot, name: p.name.clone(), name_style, tasks, tasks_style: tasks_s, subs, subs_style: subs_s, notes, notes_style: Style::new().fg(subtle()) }
+            RowSpec {
+                prefix: vec![Span::styled(
+                    format!("{} ", icons[i]),
+                    Style::new().fg(icon_color),
+                )],
+                title: p.name.clone(),
+                title_style: name_style,
+                cells: if inner_w >= 12 { vec![tally] } else { vec![] },
+            }
         })
         .collect();
 
-    let max_name = raw.iter().map(|r| r.name.chars().count()).max().unwrap_or(0);
-
-    let pw = (pane_w as f64 * 0.05) as usize;
-    let tasks_w = (raw.iter().map(|r| dw(&r.tasks)).max().unwrap_or(5).max(5) + pw).max(6);
-    let subs_w = (raw.iter().map(|r| dw(&r.subs)).max().unwrap_or(5).max(5) + pw).max(6);
-    let notes_w = (raw.iter().map(|r| dw(&r.notes)).max().unwrap_or(3).max(3) + pw).max(4);
-    let meta_total = 2 + tasks_w + 2 + subs_w + 2 + notes_w;
-    let name_w = pane_w.saturating_sub(icon_w + 1 + meta_total).max(max_name);
-
-    let header = ListItem::new(Line::from(vec![
-        Span::raw("  "),
-        Span::styled(
-            " ".repeat(name_w),
-            Style::new().fg(subtle()).bold(),
-        ),
-        Span::styled(" │ ", Style::new().fg(border())),
-        Span::styled(center("󰆼", tasks_w), Style::new().fg(subtle()).bold()),
-        Span::styled(" │ ", Style::new().fg(border())),
-        Span::styled(center("󰆸", subs_w), Style::new().fg(subtle()).bold()),
-        Span::styled(" │ ", Style::new().fg(border())),
-        Span::styled(center("󰈙", notes_w), Style::new().fg(subtle()).bold()),
-    ]));
-
-    let mut items = vec![header];
-    for (i, r) in raw.into_iter().enumerate() {
-        let nc = r.name.chars().count();
-        let pad = if nc < name_w {
-            " ".repeat(name_w - nc)
-        } else {
-            String::new()
-        };
-        let mut lines: Vec<Line> = vec![Line::from(vec![
-            r.dot,
-            Span::styled(r.name, r.name_style),
-            Span::raw(pad),
-            Span::styled(" │ ", Style::new().fg(border())),
-            Span::styled(center(&r.tasks, tasks_w), r.tasks_style),
-            Span::styled(" │ ", Style::new().fg(border())),
-            Span::styled(center(&r.subs, subs_w), r.subs_style),
-            Span::styled(" │ ", Style::new().fg(border())),
-            Span::styled(center(&r.notes, notes_w), r.notes_style),
-        ])];
+    let mut items: Vec<ListItem> = Vec::with_capacity(app.store.projects.len());
+    for (i, line) in meta_rows(inner_w, specs).into_iter().enumerate() {
+        let p = &app.store.projects[i];
+        let (sd, st) = p.subtask_progress();
+        let nc = p.note_count();
+        let total = p.todos.len();
+        let mut lines = vec![line];
 
         if app.project_info && i == app.project_idx {
-            if let Some(p) = app.current_project() {
-                lines.push(Line::from(""));
+            let label = |s: &str| Span::styled(format!("   {s:<11}"), Style::new().fg(subtle()));
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                label("created"),
+                Span::styled(
+                    p.created.format("%Y-%m-%d").to_string(),
+                    Style::new().fg(text()),
+                ),
+            ]));
+            if !p.tags.is_empty() {
                 lines.push(Line::from(vec![
-                    Span::styled("   created  ", Style::new().fg(subtle())),
-                    Span::styled(p.created.format("%Y-%m-%d").to_string(), Style::new().fg(text())),
+                    label("tags"),
+                    Span::styled(
+                        p.tags
+                            .iter()
+                            .map(|t| format!("#{t}"))
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                        Style::new().fg(blue()),
+                    ),
                 ]));
-                if !p.description.is_empty() {
-                    lines.push(Line::from(vec![
-                        Span::styled("   desc     ", Style::new().fg(subtle())),
-                        Span::styled(p.description.clone(), Style::new().fg(text())),
-                    ]));
-                }
-                if let Some(repo) = &p.repo {
-                    lines.push(Line::from(vec![
-                        Span::styled("   repo     ", Style::new().fg(subtle())),
-                        Span::styled(repo.clone(), Style::new().fg(blue())),
-                    ]));
-                }
-                if !p.milestones.is_empty() {
-                    let done = p.milestones.iter().filter(|m| m.done).count();
-                    let total = p.milestones.len();
-                    let style = if done == total {
-                        Style::new().fg(green())
-                    } else {
-                        Style::new().fg(subtle())
-                    };
-                    lines.push(Line::from(vec![
-                        Span::styled("   milestones", Style::new().fg(subtle())),
-                        Span::styled(format!("  {done}/{total}"), style),
-                    ]));
-                }
             }
+            if total > 0 {
+                lines.push(Line::from(vec![
+                    label("todos"),
+                    Span::styled(
+                        format!("{}/{total}", p.done_todos()),
+                        Style::new().fg(text()),
+                    ),
+                ]));
+            }
+            if st > 0 {
+                lines.push(Line::from(vec![
+                    label("subtasks"),
+                    Span::styled(format!("{sd}/{st}"), Style::new().fg(text())),
+                ]));
+            }
+            if nc > 0 {
+                lines.push(Line::from(vec![
+                    label("notes"),
+                    Span::styled(format!("{nc}"), Style::new().fg(text())),
+                ]));
+            }
+            if !p.description.is_empty() {
+                lines.push(Line::from(vec![
+                    label("desc"),
+                    Span::styled(p.description.clone(), Style::new().fg(text())),
+                ]));
+            }
+            if let Some(repo) = &p.repo {
+                lines.push(Line::from(vec![
+                    label("repo"),
+                    Span::styled(repo.clone(), Style::new().fg(blue())),
+                ]));
+            }
+            if !p.milestones.is_empty() {
+                let done = p.milestones.iter().filter(|m| m.done).count();
+                let mtot = p.milestones.len();
+                let mstyle = if done == mtot {
+                    Style::new().fg(green())
+                } else {
+                    Style::new().fg(subtle())
+                };
+                lines.push(Line::from(vec![
+                    label("milestones"),
+                    Span::styled(format!("{done}/{mtot}"), mstyle),
+                ]));
+            }
+            lines.push(Line::from(""));
         }
         items.push(ListItem::new(lines));
     }
@@ -349,7 +307,7 @@ fn render_projects(f: &mut Frame, area: Rect, app: &App) {
         })
         .highlight_symbol(if focused { "▍" } else { " " });
     let mut state = ListState::default();
-    state.select(Some(app.project_idx + 1));
+    state.select(Some(app.project_idx));
     f.render_stateful_widget(list, area, &mut state);
 }
 
@@ -364,10 +322,11 @@ fn render_content(f: &mut Frame, area: Rect, app: &App) {
 
 /// The bordered block for the middle pane. Its top border carries the tab strip
 /// (left) and the project name (right), so no separate tab row is needed.
-fn content_block(app: &App) -> Block<'static> {
+fn content_block(app: &App, width: u16) -> Block<'static> {
     let focused = app.focus == Focus::Content;
 
     let mut spans = Vec::new();
+    let mut tabs_w = 0usize;
     for t in Tab::ALL {
         let active = t == app.tab;
         let style = if active {
@@ -377,7 +336,9 @@ fn content_block(app: &App) -> Block<'static> {
         } else {
             Style::new().fg(border())
         };
-        spans.push(Span::styled(format!(" {} ", t.title()), style));
+        let label = format!(" {} ", t.title());
+        tabs_w += label.chars().count();
+        spans.push(Span::styled(label, style));
     }
     let tabs = Line::from(spans);
 
@@ -387,20 +348,24 @@ fn content_block(app: &App) -> Block<'static> {
         .border_style(Style::new().fg(if focused { accent() } else { border() }))
         .title(tabs);
 
+    // The project name on the right only when it won't crowd the tab strip.
     if let Some(p) = app.current_project() {
-        block = block.title(
-            Line::from(Span::styled(
-                format!(" {} ", truncate(&p.name, 28)),
-                Style::new().fg(subtle()),
-            ))
-            .right_aligned(),
-        );
+        let room = (width as usize).saturating_sub(tabs_w + 4);
+        if room >= 8 {
+            block = block.title(
+                Line::from(Span::styled(
+                    format!(" {} ", truncate(&p.name, room)),
+                    Style::new().fg(subtle()),
+                ))
+                .right_aligned(),
+            );
+        }
     }
     block
 }
 
 fn render_overview(f: &mut Frame, area: Rect, app: &App) {
-    let block = content_block(app).padding(Padding::horizontal(1));
+    let block = content_block(app, area.width).padding(Padding::horizontal(1));
 
     let Some(p) = app.current_project() else {
         f.render_widget(hint("No project selected.").block(block), area);
@@ -435,6 +400,17 @@ fn render_overview(f: &mut Frame, area: Rect, app: &App) {
         ])
     };
 
+    let bar_w = (area.width as usize).saturating_sub(20).clamp(10, 30);
+    let label = |s: &str| Span::styled(format!("{s:<11}"), Style::new().fg(subtle()));
+    let stat = |d: usize, t: usize| {
+        let style = if t > 0 && d == t {
+            Style::new().fg(green())
+        } else {
+            Style::new().fg(text())
+        };
+        Span::styled(format!("{d}/{t}"), style)
+    };
+
     let mut lines = vec![
         name_line,
         Line::from(Span::styled(
@@ -446,40 +422,41 @@ fn render_overview(f: &mut Frame, area: Rect, app: &App) {
             Style::new().fg(subtle()),
         )),
         Line::from(""),
+        Line::from(vec![label("Todos"), stat(done, total)]),
         Line::from(vec![
-            Span::styled("Todos     ", Style::new().fg(subtle())),
-            Span::styled(format!("{done}/{total} done"), Style::new().fg(text())),
-        ]),
-        Line::from(vec![
-            Span::styled("          ", Style::new().fg(subtle())),
-            Span::styled(progress_bar(done, total, 22), Style::new().fg(green())),
+            Span::raw("           "),
+            Span::styled(progress_bar(done, total, bar_w), Style::new().fg(green())),
         ]),
     ];
 
     if subs > 0 {
-        lines.push(Line::from(vec![
-            Span::styled("Subtasks  ", Style::new().fg(subtle())),
-            Span::styled(format!("{subs_done}/{subs} done"), Style::new().fg(text())),
-        ]));
+        lines.push(Line::from(vec![label("Subtasks"), stat(subs_done, subs)]));
     }
     lines.push(Line::from(vec![
-        Span::styled("Notes     ", Style::new().fg(subtle())),
-        Span::styled(format!("{}", p.notes.len()), Style::new().fg(text())),
+        label("Notes"),
+        Span::styled(p.notes.len().to_string(), Style::new().fg(text())),
     ]));
+    if !p.milestones.is_empty() {
+        let md = p.milestones.iter().filter(|m| m.done).count();
+        lines.push(Line::from(vec![
+            label("Milestones"),
+            stat(md, p.milestones.len()),
+        ]));
+    }
     lines.push(Line::from(""));
 
     match p.next_milestone() {
         Some(m) => lines.push(Line::from(vec![
-            Span::styled("Next      ", Style::new().fg(subtle())),
+            label("Next"),
             Span::styled("◆ ", Style::new().fg(accent())),
             Span::styled(m.title.clone(), Style::new().fg(text())),
             Span::styled(
-                format!("  {} · {}", m.date.format("%Y-%m-%d"), rel(m.date, today)),
+                format!("   {} · {}", m.date.format("%b %d"), rel(m.date, today)),
                 Style::new().fg(subtle()),
             ),
         ])),
         None => lines.push(Line::from(vec![
-            Span::styled("Next      ", Style::new().fg(subtle())),
+            label("Next"),
             Span::styled("no upcoming milestones", Style::new().fg(subtle())),
         ])),
     }
@@ -492,7 +469,7 @@ fn render_overview(f: &mut Frame, area: Rect, app: &App) {
 
 fn render_notes(f: &mut Frame, area: Rect, app: &App) {
     let focused = app.focus == Focus::Content && app.tab == Tab::Notes;
-    let block = content_block(app);
+    let block = content_block(app, area.width);
 
     let Some(project) = app.current_project() else {
         f.render_widget(hint("Select a project to keep notes.").block(block), area);
@@ -506,7 +483,8 @@ fn render_notes(f: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    let items: Vec<ListItem> = project
+    let inner_w = list_inner_w(area);
+    let specs: Vec<RowSpec> = project
         .notes
         .iter()
         .map(|n| {
@@ -515,15 +493,23 @@ fn render_notes(f: &mut Frame, area: Rect, app: &App) {
             } else {
                 ("• ", Style::new().fg(subtle()))
             };
-            let mut spans = vec![
-                Span::styled(mark, mark_style),
-                Span::styled(n.text.clone(), Style::new().fg(text())),
-            ];
-            if !n.body.trim().is_empty() {
-                spans.push(Span::styled(" ¶", Style::new().fg(subtle())));
+            let cell = if n.body.trim().is_empty() || inner_w < 16 {
+                (String::new(), Style::default())
+            } else {
+                let lines = n.body.lines().filter(|l| !l.trim().is_empty()).count();
+                (format!("¶ {lines}"), Style::new().fg(subtle()))
+            };
+            RowSpec {
+                prefix: vec![Span::styled(mark, mark_style)],
+                title: n.text.clone(),
+                title_style: Style::new().fg(text()),
+                cells: vec![cell],
             }
-            ListItem::new(Line::from(spans))
         })
+        .collect();
+    let items: Vec<ListItem> = meta_rows(inner_w, specs)
+        .into_iter()
+        .map(ListItem::new)
         .collect();
 
     let list = List::new(items)
@@ -541,7 +527,7 @@ fn render_notes(f: &mut Frame, area: Rect, app: &App) {
 
 fn render_todos(f: &mut Frame, area: Rect, app: &App) {
     let focused = app.focus == Focus::Content && app.tab == Tab::Todos;
-    let block = content_block(app);
+    let block = content_block(app, area.width);
 
     let Some(project) = app.current_project() else {
         f.render_widget(
@@ -559,8 +545,8 @@ fn render_todos(f: &mut Frame, area: Rect, app: &App) {
     }
 
     let today = Local::now().date_naive();
-    let block = if let Some(t) = project.todos.get(app.todo_idx) {
-        let footer = if let Some(d) = t.due {
+    let block = match project.todos.get(app.todo_idx).and_then(|t| t.due.map(|d| (t, d))) {
+        Some((t, d)) => {
             let style = if !t.done && d < today {
                 Style::new().fg(red()).bold()
             } else if d == today {
@@ -574,14 +560,17 @@ fn render_todos(f: &mut Frame, area: Rect, app: &App) {
                 format!("due {}", d.format("%b %d"))
             };
             block.title_bottom(Line::from(Span::styled(format!(" {label} "), style)))
-        } else {
-            block
-        };
-        footer
-    } else {
-        block
+        }
+        None => block,
     };
-    let items: Vec<ListItem> = project
+    let inner_w = list_inner_w(area);
+    // Metadata columns, left to right: priority · subtasks · note · file · due.
+    // Which columns appear is a whole-pane decision (so rows stay aligned); the
+    // narrower the pane, the fewer are kept.
+    let show_prio = inner_w >= 16;
+    let show_marks = inner_w >= 34;
+    let show_subs = inner_w >= 42;
+    let specs: Vec<RowSpec> = project
         .todos
         .iter()
         .map(|t| {
@@ -597,40 +586,74 @@ fn render_todos(f: &mut Frame, area: Rect, app: &App) {
             } else {
                 Style::new().fg(text())
             };
-            let mut spans = vec![
-                Span::styled(mark, mark_style),
-                Span::styled(t.title.clone(), title_style),
-                Span::styled(format!("  {}", t.priority.label()), prio_style(t.priority)),
-            ];
-            if let Some(d) = t.due {
-                let style = if !t.done && d < today {
-                    Style::new().fg(red()).bold()
-                } else {
-                    Style::new().fg(subtle())
-                };
-                spans.push(Span::styled(format!("  {}", d.format("%b %d")), style));
-            }
+
             let (sdone, stotal) = t.subtask_progress();
-            if stotal > 0 {
+            let subs = if stotal > 0 {
                 let style = if sdone == stotal {
                     Style::new().fg(green())
                 } else {
                     Style::new().fg(subtle())
                 };
-                spans.push(Span::styled(format!("  ⊞ {sdone}/{stotal}"), style));
-            }
-            if !t.note.trim().is_empty() {
-                spans.push(Span::styled("  ¶", Style::new().fg(subtle())));
-            }
-            if !t.attachments.is_empty() {
-                spans.push(Span::styled(
-                    format!("  \u{f0c6} {}", t.attachments.len()),
+                (format!("⊞{sdone}/{stotal}"), style)
+            } else {
+                (String::new(), Style::default())
+            };
+            let note = if t.note.trim().is_empty() {
+                (String::new(), Style::default())
+            } else {
+                ("¶".to_string(), Style::new().fg(subtle()))
+            };
+            let files = if t.attachments.is_empty() {
+                (String::new(), Style::default())
+            } else {
+                (
+                    format!("\u{f0c6}{}", t.attachments.len()),
                     Style::new().fg(subtle()),
-                ));
+                )
+            };
+            let due = match t.due {
+                Some(d) => {
+                    let style = if !t.done && d < today {
+                        Style::new().fg(red()).bold()
+                    } else if d == today {
+                        Style::new().fg(green())
+                    } else {
+                        Style::new().fg(subtle())
+                    };
+                    (d.format("%b %d").to_string(), style)
+                }
+                None => (String::new(), Style::default()),
+            };
+
+            let mut cells = Vec::new();
+            if show_prio {
+                cells.push(prio_cell(t.priority));
             }
-            ListItem::new(Line::from(spans))
+            if show_subs {
+                cells.push(subs);
+            }
+            if show_marks {
+                cells.push(note);
+                cells.push(files);
+            }
+            cells.push(due);
+
+            RowSpec {
+                prefix: vec![Span::styled(mark, mark_style)],
+                title: t.title.clone(),
+                title_style,
+                cells,
+            }
         })
         .collect();
+    let mut items: Vec<ListItem> = Vec::with_capacity(project.todos.len());
+    for (i, line) in meta_rows(inner_w, specs).into_iter().enumerate() {
+        let mut lines = vec![line];
+        if app.todo_info && i == app.todo_idx {
+            lines.extend(todo_detail_lines(&project.todos[i], today));
+        }
+        items.push(ListItem::new(lines));
+    }
 
     let list = List::new(items)
         .block(block)
@@ -702,7 +725,10 @@ fn render_subtasks(f: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    let items: Vec<ListItem> = todo
+    let inner_w = list_inner_w(area);
+    let show_prio = inner_w >= 14;
+    let show_marks = inner_w >= 26;
+    let specs: Vec<RowSpec> = todo
         .subtasks
         .iter()
         .map(|s| {
@@ -718,23 +744,46 @@ fn render_subtasks(f: &mut Frame, area: Rect, app: &App) {
             } else {
                 Style::new().fg(text())
             };
-            let mut spans = vec![
-                Span::styled(mark, mark_style),
-                Span::styled(s.title.clone(), title_style),
-                Span::styled(format!("  {}", s.priority.label()), prio_style(s.priority)),
-            ];
-            if !s.note.trim().is_empty() {
-                spans.push(Span::styled("  ¶", Style::new().fg(subtle())));
-            }
-            if !s.attachments.is_empty() {
-                spans.push(Span::styled(
-                    format!("  \u{f0c6} {}", s.attachments.len()),
+
+            let note = if s.note.trim().is_empty() {
+                (String::new(), Style::default())
+            } else {
+                ("¶".to_string(), Style::new().fg(subtle()))
+            };
+            let files = if s.attachments.is_empty() {
+                (String::new(), Style::default())
+            } else {
+                (
+                    format!("\u{f0c6}{}", s.attachments.len()),
                     Style::new().fg(subtle()),
-                ));
+                )
+            };
+
+            let mut cells = Vec::new();
+            if show_prio {
+                cells.push(prio_cell(s.priority));
             }
-            ListItem::new(Line::from(spans))
+            if show_marks {
+                cells.push(note);
+                cells.push(files);
+            }
+
+            RowSpec {
+                prefix: vec![Span::styled(mark, mark_style)],
+                title: s.title.clone(),
+                title_style,
+                cells,
+            }
         })
         .collect();
+    let mut items: Vec<ListItem> = Vec::with_capacity(todo.subtasks.len());
+    for (i, line) in meta_rows(inner_w, specs).into_iter().enumerate() {
+        let mut lines = vec![line];
+        if app.subtask_info && i == app.subtask_idx {
+            lines.extend(subtask_detail_lines(&todo.subtasks[i]));
+        }
+        items.push(ListItem::new(lines));
+    }
 
     let list = List::new(items)
         .block(block)
@@ -931,7 +980,7 @@ fn render_edit_body_pane(f: &mut Frame, area: Rect, state: &crate::app::EditStat
 
 fn render_timeline(f: &mut Frame, area: Rect, app: &App) {
     let focused = app.focus == Focus::Content && app.tab == Tab::Schedule;
-    let block = content_block(app);
+    let block = content_block(app, area.width);
 
     let (total, done, _overdue, _today_count, _this_week) = app.deadline_stats();
 
@@ -965,38 +1014,52 @@ fn render_timeline(f: &mut Frame, area: Rect, app: &App) {
         block
     };
 
-    let make_item = |e: &TimelineEntry| -> ListItem {
-        let (icon, icon_style) = match e.kind {
-            TlKind::Milestone => ("◆ ", Style::new().fg(accent())),
-            TlKind::Todo if e.done => ("✔ ", Style::new().fg(green())),
-            TlKind::Todo => ("○ ", Style::new().fg(subtle())),
-        };
-        let date_style = if !e.done && e.date < today {
-            Style::new().fg(red())
-        } else if e.date == today {
-            Style::new().fg(green())
-        } else {
-            Style::new().fg(blue())
-        };
-        let label_style = if e.done {
-            Style::new()
-                .fg(subtle())
-                .add_modifier(Modifier::CROSSED_OUT)
-        } else {
-            Style::new().fg(text())
-        };
-        ListItem::new(Line::from(vec![
-            Span::styled(format!("{}  ", e.date.format("%Y-%m-%d")), date_style),
-            Span::styled(icon, icon_style),
-            Span::styled(e.label.clone(), label_style),
-            Span::styled(
-                format!("   {}", rel(e.date, today)),
-                Style::new().fg(subtle()),
-            ),
-        ]))
-    };
-
-    let items: Vec<ListItem> = entries.iter().map(make_item).collect();
+    let inner_w = list_inner_w(area);
+    let specs: Vec<RowSpec> = entries
+        .iter()
+        .map(|e| {
+            let (icon, icon_style) = match e.kind {
+                TlKind::Milestone => ("◆ ", Style::new().fg(accent())),
+                TlKind::Todo if e.done => ("✔ ", Style::new().fg(green())),
+                TlKind::Todo => ("○ ", Style::new().fg(subtle())),
+            };
+            let overdue = !e.done && e.date < today;
+            let date_style = if overdue {
+                Style::new().fg(red())
+            } else if e.date == today {
+                Style::new().fg(green())
+            } else {
+                Style::new().fg(blue())
+            };
+            let label_style = if e.done {
+                Style::new()
+                    .fg(subtle())
+                    .add_modifier(Modifier::CROSSED_OUT)
+            } else {
+                Style::new().fg(text())
+            };
+            let rel_style = if overdue {
+                Style::new().fg(red()).bold()
+            } else if e.date == today {
+                Style::new().fg(green())
+            } else {
+                Style::new().fg(subtle())
+            };
+            RowSpec {
+                prefix: vec![
+                    Span::styled(format!("{}  ", e.date.format("%Y-%m-%d")), date_style),
+                    Span::styled(icon, icon_style),
+                ],
+                title: e.label.clone(),
+                title_style: label_style,
+                cells: vec![(rel(e.date, today), rel_style)],
+            }
+        })
+        .collect();
+    let items: Vec<ListItem> = meta_rows(inner_w, specs)
+        .into_iter()
+        .map(ListItem::new)
+        .collect();
 
     // Progress bar in top-right
     if area.width > 40 {
@@ -1033,10 +1096,10 @@ fn render_timeline(f: &mut Frame, area: Rect, app: &App) {
 /// The most useful keys for wherever focus currently is.
 fn context_hints(app: &App) -> &'static str {
     match (app.focus, app.tab) {
-        (Focus::Projects, _) => "a add · r rename · l open · / find · o github · ^y sync",
-        (Focus::Content, Tab::Overview) => "e description · r rename · / find",
+        (Focus::Projects, _) => "a add · r rename · l open · i detail · t tags · / find · o github",
+        (Focus::Content, Tab::Overview) => "e description · r rename · t tags · / find",
         (Focus::Content, Tab::Todos) => {
-            "a add · e edit · x done · p prio · o sort · n view note · N edit note · A files · l subtasks"
+            "a add · e edit · x done · p prio · o sort · i detail · N note · t tags · l subtasks"
         }
         (Focus::Content, Tab::Notes) => "a add · e title · x pin · J/K move · l open · / find · d del",
         (Focus::Content, Tab::Schedule) => {
@@ -1044,7 +1107,7 @@ fn context_hints(app: &App) -> &'static str {
         }
         (Focus::Detail, Tab::Notes) => "j/k scroll · ^d/^u page · e edit · space expand · h back",
         (Focus::Detail, _) => {
-            "a add · e edit · x done · p prio · n view note · N edit note · A files · h back"
+            "a add · e edit · x done · p prio · i detail · N note · t tags · A files · h back"
         }
     }
 }
@@ -1055,9 +1118,12 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
         Mode::Input(_) | Mode::EditBody(_) | Mode::Search(_) => ("I", green()),
         Mode::Confirm(_) => ("CONFIRM", red()),
         Mode::Notice(..) => ("NOTICE", red()),
-        Mode::Normal | Mode::Help(_) | Mode::GitHub | Mode::Theme(_) | Mode::Attach(_) => {
-            ("N", accent())
-        }
+        Mode::Normal
+        | Mode::Help
+        | Mode::GitHub
+        | Mode::Theme(_)
+        | Mode::Attach(_)
+        | Mode::Tags(_) => ("N", accent()),
     };
     let pane_label = match app.focus {
         Focus::Projects => "PROJECTS",
@@ -1125,17 +1191,15 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
             "j / k  preview    enter  apply    esc  cancel",
             Style::new().fg(subtle()),
         )),
-        Mode::Help(_) => {
-            spans.push(Span::styled(
-                "← → tabs · any key close",
-                Style::new().fg(subtle()),
-            ))
-        }
-        Mode::GitHub | Mode::Notice(..) => {
+        Mode::Help | Mode::GitHub | Mode::Notice(..) => {
             spans.push(Span::styled("any key  close", Style::new().fg(subtle())))
         }
         Mode::Attach(_) => spans.push(Span::styled(
             "a add · o open · d delete · esc close",
+            Style::new().fg(subtle()),
+        )),
+        Mode::Tags(_) => spans.push(Span::styled(
+            "a add · d delete · esc close",
             Style::new().fg(subtle()),
         )),
         Mode::Search(_) => spans.push(Span::styled(
@@ -1301,116 +1365,71 @@ fn render_confirm(f: &mut Frame, area: Rect, c: &ConfirmState) {
     );
 }
 
-fn render_help(f: &mut Frame, area: Rect, tab: HelpTab) {
+fn render_help(f: &mut Frame, area: Rect) {
     type Row = (&'static str, &'static str);
 
-    const GENERAL_COL1: &[Row] = &[
+    const COL1: &[Row] = &[
         ("", "MOVE"),
-        ("h j k l", "move / switch pane"),
+        ("h j k l", "move · switch pane"),
         ("w  s", "prev / next project"),
-        ("tab  S-tab", "prev / next view"),
-        ("1 … 4", "jump to a view"),
-        ("gg  G", "top / bottom"),
-        ("esc", "back out one pane"),
+        ("J  K", "reorder selected"),
+        ("gg  G", "jump top / bottom"),
+        ("esc", "step back · close"),
         ("", ""),
-        ("", "GENERAL"),
-        ("?  q", "help · quit"),
+        ("", "VIEWS"),
+        ("1 2 3 4", "Overview·Todos·Notes·Sched"),
+        ("tab S-tab", "cycle view"),
         ("/", "fuzzy find"),
         ("m", "minimal view"),
-        ("click", "focus pane / row"),
         ("", ""),
-        ("", "QUICK-ADD (todo)"),
-        ("!1 !2 !3", "priority"),
-        ("@date", "due  (YYYY-MM-DD)"),
+        ("", "SYSTEM"),
+        ("?  q", "help · quit  (^c)"),
+        ("^t  ^e", "theme · edit settings"),
+        ("^y  ^g", "GitHub sync · link repo"),
     ];
-    const GENERAL_COL2: &[Row] = &[
+    const COL2: &[Row] = &[
         ("", "PROJECTS"),
-        ("a  r  d", "add / rename / del"),
-        ("l  i", "open · info"),
-        ("o", "show repo activity"),
+        ("a r d", "add · rename · delete"),
+        ("l", "open"),
+        ("i", "detail panel"),
+        ("t", "tags"),
+        ("o", "repo activity"),
         ("", ""),
         ("", "OVERVIEW"),
-        ("e", "edit description"),
-        ("r", "rename project"),
+        ("e  r", "description · rename"),
+        ("t", "tags"),
         ("", ""),
         ("", "SCHEDULE"),
         ("a", "add milestone"),
-        ("e  d", "edit / delete"),
-        ("x", "toggle done"),
-        ("r", "reschedule date"),
-        ("f", "cycle date filter"),
-        ("l", "jump to the todo"),
+        ("e  d", "edit · delete"),
+        ("x  r", "done · reschedule"),
+        ("f", "cycle filter"),
+        ("l", "jump to todo"),
     ];
-    const GENERAL_COL3: &[Row] = &[
-        ("", "TODOS / SUBTASKS"),
-        ("a  e  d", "add / edit / delete"),
-        ("x / space", "toggle done"),
-        ("p", "cycle priority"),
-        ("o", "sort by priority"),
-        ("J  K", "move up / down"),
+    const COL3: &[Row] = &[
+        ("", "TODOS · SUBTASKS"),
+        ("a e d", "add · edit · delete"),
+        ("x  space", "toggle done"),
+        ("p  o", "priority · sort"),
         ("l", "open subtasks"),
-        ("n  N", "view / edit note"),
-        ("^d  ^u", "scroll shown note"),
-        ("A", "attachments"),
+        ("i", "detail panel"),
+        ("n  N", "view · edit note"),
+        ("t  A", "tags · attachments"),
         ("", ""),
         ("", "NOTES"),
-        ("a  e  d", "add / edit / delete"),
-        ("x / space", "pin / unpin"),
-        ("J  K", "move up / down"),
-        ("l", "open note body"),
+        ("a e d", "add · edit · delete"),
+        ("x", "pin / unpin"),
+        ("l", "open body"),
         ("", ""),
-        ("", "NOTE BODY"),
+        ("", "NOTE BODY / EDITOR"),
         ("j k ^d ^u", "scroll · page"),
         ("space", "expand / collapse"),
-        ("e  i", "edit  (^s = save)"),
+        ("e  ^s", "edit · save & close"),
     ];
 
-    const MAIN_COL1: &[Row] = &[
-        ("", "SYSTEM"),
-        ("^c", "quit"),
-        ("^e", "edit settings file"),
-        ("^t", "change theme"),
-        ("", ""),
-        ("", "SYNC"),
-        ("^y", "sync to GitHub"),
-        ("^g", "link project's repo"),
-    ];
-    const MAIN_COL2: &[Row] = &[
-        ("", "NOTE BODY"),
-        ("^d", "scroll down ½ page"),
-        ("^u", "scroll up ½ page"),
-        ("^s", "save & close editor"),
-    ];
-    const MAIN_COL3: &[Row] = &[];
-
-    let render_col = |rows: &[Row]| -> Vec<Line<'static>> {
-        rows.iter()
-            .map(|(key, desc)| {
-                if key.is_empty() && desc.is_empty() {
-                    Line::from("")
-                } else if key.is_empty() {
-                    Line::from(Span::styled(
-                        (*desc).to_string(),
-                        Style::new().fg(accent()).bold(),
-                    ))
-                } else {
-                    Line::from(vec![
-                        Span::styled(format!("{key:<10} "), Style::new().fg(yellow())),
-                        Span::styled((*desc).to_string(), Style::new().fg(subtle())),
-                    ])
-                }
-            })
-            .collect()
-    };
-
-    let (c1, c2, c3) = match tab {
-        HelpTab::General => (GENERAL_COL1, GENERAL_COL2, GENERAL_COL3),
-        HelpTab::Main => (MAIN_COL1, MAIN_COL2, MAIN_COL3),
-    };
-
-    let rows = c1.len().max(c2.len()).max(c3.len());
-    let width = 110u16.min(area.width);
-    let height = (rows as u16 + 4).min(area.height);
+    let rows = COL1.len().max(COL2.len()).max(COL3.len()) as u16;
+    let width = 96u16.min(area.width);
+    let height = (rows + 6).min(area.height);
     let rect = popup(area, width, height);
     overlay(f, rect);
 
@@ -1418,53 +1437,62 @@ fn render_help(f: &mut Frame, area: Rect, tab: HelpTab) {
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(accent()))
-        .title(Span::styled(
-            " Keybindings ",
-            Style::new().fg(accent()).bold(),
-        ))
-        .padding(Padding::horizontal(2));
+        .title(Span::styled(" Keybindings ", Style::new().fg(accent()).bold()))
+        .title(
+            Line::from(Span::styled(" any key to close ", Style::new().fg(subtle())))
+                .right_aligned(),
+        )
+        .padding(Padding::symmetric(2, 1));
     let inner = block.inner(rect);
     f.render_widget(block, rect);
 
-    let tab_row = Layout::vertical([Constraint::Length(2), Constraint::Min(0)]).split(inner);
-
-    let tab_labels = [" General ", " Main "];
-    let tab_spans: Vec<Span> = tab_labels
-        .iter()
-        .enumerate()
-        .flat_map(|(i, label)| {
-            let is_active = (i == 0 && tab == HelpTab::General)
-                || (i == 1 && tab == HelpTab::Main);
-            let style = if is_active {
-                Style::new().fg(accent()).bold()
-            } else {
-                Style::new().fg(subtle())
-            };
-            let sep = if i > 0 {
-                vec![Span::styled(" │ ", Style::new().fg(border()))]
-            } else {
-                vec![]
-            };
-            sep.into_iter()
-                .chain(std::iter::once(Span::styled(*label, style)))
-                .collect::<Vec<_>>()
-        })
-        .collect();
-    f.render_widget(
-        Paragraph::new(Line::from(tab_spans)),
-        tab_row[0],
-    );
-
+    let body = Layout::vertical([Constraint::Min(0), Constraint::Length(2)]).split(inner);
     let cols = Layout::horizontal([
         Constraint::Ratio(1, 3),
         Constraint::Ratio(1, 3),
         Constraint::Ratio(1, 3),
     ])
     .spacing(2)
-    .split(tab_row[1]);
-    f.render_widget(Paragraph::new(render_col(c1)), cols[0]);
-    f.render_widget(Paragraph::new(render_col(c2)), cols[1]);
-    f.render_widget(Paragraph::new(render_col(c3)), cols[2]);
+    .split(body[0]);
+
+    let render_col = |rows: &[Row], w: u16| -> Vec<Line<'static>> {
+        rows.iter()
+            .map(|(key, desc)| {
+                if key.is_empty() && desc.is_empty() {
+                    Line::from("")
+                } else if key.is_empty() {
+                    // Section header with a trailing rule.
+                    let fill = (w as usize).saturating_sub(desc.chars().count() + 1);
+                    Line::from(vec![
+                        Span::styled(format!("{desc} "), Style::new().fg(accent()).bold()),
+                        Span::styled("─".repeat(fill), Style::new().fg(border())),
+                    ])
+                } else {
+                    Line::from(vec![
+                        Span::styled(format!("{key:<10}"), Style::new().fg(text())),
+                        Span::styled((*desc).to_string(), Style::new().fg(subtle())),
+                    ])
+                }
+            })
+            .collect()
+    };
+
+    f.render_widget(Paragraph::new(render_col(COL1, cols[0].width)), cols[0]);
+    f.render_widget(Paragraph::new(render_col(COL2, cols[1].width)), cols[1]);
+    f.render_widget(Paragraph::new(render_col(COL3, cols[2].width)), cols[2]);
+
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("QUICK-ADD   ", Style::new().fg(accent()).bold()),
+            Span::styled("!1 !2 !3", Style::new().fg(text())),
+            Span::styled(" priority     ", Style::new().fg(subtle())),
+            Span::styled("@YYYY-MM-DD", Style::new().fg(text())),
+            Span::styled(" due     ", Style::new().fg(subtle())),
+            Span::styled("#tag", Style::new().fg(text())),
+            Span::styled(" tag", Style::new().fg(subtle())),
+        ])),
+        body[1],
+    );
 }
 
 fn render_github(f: &mut Frame, area: Rect, app: &App) {
@@ -1705,28 +1733,110 @@ fn render_attach(f: &mut Frame, area: Rect, state: &AttachState, app: &App) {
     f.render_stateful_widget(list, inner, &mut ls);
 }
 
-fn render_search(f: &mut Frame, area: Rect, state: &SearchState, app: &App) {
-    let width = area.width.saturating_sub(6).clamp(40, 92);
-    let height = area.height.saturating_sub(4).clamp(8, 24);
+fn render_tags(f: &mut Frame, area: Rect, state: &TagState, app: &App) {
+    let width = area.width.saturating_sub(8).clamp(34, 60);
+    let empty: Vec<String> = Vec::new();
+    let tags = app.tags_at(state.target).unwrap_or(&empty);
+    let height = (tags.len() as u16 + 6).clamp(8, area.height.saturating_sub(2));
     let rect = popup(area, width, height);
     overlay(f, rect);
 
+    let name = match state.target {
+        TagTarget::Project => app
+            .current_project()
+            .map(|p| truncate(&p.name, 34))
+            .unwrap_or_default(),
+        TagTarget::Todo(i) => app
+            .current_project()
+            .and_then(|p| p.todos.get(i))
+            .map(|t| truncate(&t.title, 34))
+            .unwrap_or_default(),
+        TagTarget::Subtask { todo, sub } => app
+            .current_project()
+            .and_then(|p| p.todos.get(todo))
+            .and_then(|t| t.subtasks.get(sub))
+            .map(|s| format!("↳ {}", truncate(&s.title, 32)))
+            .unwrap_or_default(),
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(accent()))
+        .title(Span::styled(
+            format!(" Tags · {name} "),
+            Style::new().fg(accent()).bold(),
+        ))
+        .title(
+            Line::from(Span::styled(
+                " a add · d del ",
+                Style::new().fg(subtle()),
+            ))
+            .right_aligned(),
+        )
+        .padding(Padding::symmetric(2, 1));
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    if tags.is_empty() {
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                "No tags.  Press a to add one or more (space-separated).",
+                Style::new().fg(subtle()),
+            ))
+            .wrap(Wrap { trim: true }),
+            inner,
+        );
+        return;
+    }
+
+    let items: Vec<ListItem> = tags
+        .iter()
+        .map(|t| ListItem::new(Line::from(Span::styled(format!("#{t}"), Style::new().fg(blue())))))
+        .collect();
+    let list = List::new(items)
+        .highlight_style(Style::new().bg(sel_bg()).bold())
+        .highlight_symbol("▍");
+    let mut ls = ListState::default();
+    ls.select(Some(state.sel.min(tags.len().saturating_sub(1))));
+    f.render_stateful_widget(list, inner, &mut ls);
+}
+
+fn render_search(f: &mut Frame, area: Rect, state: &SearchState, app: &App) {
+    let width = area.width.saturating_sub(6).clamp(40, 96);
+    let height = area.height.saturating_sub(4).clamp(10, 26);
+    let rect = popup(area, width, height);
+    overlay(f, rect);
+
+    let results = app.search_results();
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(accent()))
         .title(Span::styled(" Find ", Style::new().fg(accent()).bold()))
+        .title(
+            Line::from(Span::styled(
+                format!(
+                    " {} match{} ",
+                    results.len(),
+                    if results.len() == 1 { "" } else { "es" }
+                ),
+                Style::new().fg(subtle()),
+            ))
+            .right_aligned(),
+        )
         .padding(Padding::symmetric(2, 1));
     let inner = block.inner(rect);
     f.render_widget(block, rect);
 
     let rows = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Min(0),
+        Constraint::Length(1), // input
+        Constraint::Length(1), // rule
+        Constraint::Min(0),    // results
+        Constraint::Length(1), // hint
     ])
     .split(inner);
 
+    // Input line: "› <query>"
     f.render_widget(
         Paragraph::new(Span::styled("›", Style::new().fg(accent()).bold())),
         rows[0],
@@ -1742,34 +1852,55 @@ fn render_search(f: &mut Frame, area: Rect, state: &SearchState, app: &App) {
     ta.set_selection_style(Style::new().bg(sel_bg()));
     f.render_widget(&ta, inp);
 
-    let results = app.search_results();
     f.render_widget(
         Paragraph::new(Span::styled(
-            format!(
-                "{} match{}",
-                results.len(),
-                if results.len() == 1 { "" } else { "es" }
-            ),
-            Style::new().fg(subtle()),
+            "─".repeat(rows[1].width as usize),
+            Style::new().fg(border()),
         )),
         rows[1],
     );
 
-    let items: Vec<ListItem> = results
+    let inner_w = rows[2].width.saturating_sub(1) as usize; // 1 = highlight gutter
+    let crumb_max = (inner_w / 3).clamp(10, 40);
+    let specs: Vec<RowSpec> = results
         .iter()
         .map(|h| {
-            let (icon, icon_style) = match h.target {
-                SearchTarget::Project => ("● ", Style::new().fg(accent())),
-                SearchTarget::Todo(_) => ("○ ", Style::new().fg(subtle())),
-                SearchTarget::Note(_) => ("¶ ", Style::new().fg(yellow())),
+            let (glyph, gstyle) = match h.target {
+                SearchTarget::Project => ("●", Style::new().fg(accent())),
+                SearchTarget::Todo(_) => ("○", Style::new().fg(subtle())),
+                SearchTarget::Subtask { .. } => ("↳", Style::new().fg(subtle())),
+                SearchTarget::Note(_) => ("¶", Style::new().fg(yellow())),
             };
-            ListItem::new(Line::from(vec![
-                Span::styled(icon, icon_style),
-                Span::styled(truncate(&h.label, 48), Style::new().fg(text())),
-                Span::styled(format!("   {}", h.context), Style::new().fg(subtle())),
-            ]))
+            // Indent one step per nesting level so depth reads at a glance.
+            let indent = "  ".repeat(h.target.depth());
+            let crumbs = if h.crumbs.is_empty() {
+                (String::new(), Style::default())
+            } else {
+                (
+                    truncate(&h.crumbs.join("  ›  "), crumb_max),
+                    Style::new().fg(subtle()),
+                )
+            };
+            RowSpec {
+                prefix: vec![Span::styled(format!("{indent}{glyph} "), gstyle)],
+                title: h.label.clone(),
+                title_style: Style::new().fg(text()),
+                cells: vec![crumbs],
+            }
         })
         .collect();
+
+    let items: Vec<ListItem> = if specs.is_empty() {
+        vec![ListItem::new(Span::styled(
+            "  no matches",
+            Style::new().fg(subtle()),
+        ))]
+    } else {
+        meta_rows(inner_w, specs)
+            .into_iter()
+            .map(ListItem::new)
+            .collect()
+    };
 
     let list = List::new(items)
         .highlight_style(Style::new().bg(sel_bg()).bold())
@@ -1779,6 +1910,14 @@ fn render_search(f: &mut Frame, area: Rect, state: &SearchState, app: &App) {
         ls.select(Some(state.sel.min(results.len() - 1)));
     }
     f.render_stateful_widget(list, rows[2], &mut ls);
+
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            "  ↑↓ move · enter open · esc cancel",
+            Style::new().fg(subtle()),
+        )),
+        rows[3],
+    );
 }
 
 // ---- helpers -------------------------------------------------------
@@ -1787,6 +1926,164 @@ fn render_search(f: &mut Frame, area: Rect, state: &SearchState, app: &App) {
 /// header uses the whole span available rather than a fixed character budget.
 fn fit_title(text: String, width: u16) -> String {
     truncate(&text, (width as usize).saturating_sub(4).max(8))
+}
+
+/// Content width of a bordered list pane: the pane minus its two borders and the
+/// one-column highlight gutter the `List` widget reserves.
+fn list_inner_w(area: Rect) -> usize {
+    area.width.saturating_sub(3) as usize
+}
+
+/// One right-hand metadata cell — text plus its style. An empty string is a
+/// blank slot that still holds the column's width, keeping everything aligned.
+type Cell = (String, Style);
+
+/// One list row before layout: a fixed `prefix` (mark, or date + icon), the
+/// flexible title + its style, and metadata cells in left-to-right column order.
+struct RowSpec<'a> {
+    prefix: Vec<Span<'a>>,
+    title: String,
+    title_style: Style,
+    cells: Vec<Cell>,
+}
+
+/// Lay out a batch of rows so the metadata lines up in fixed vertical columns:
+/// every row gets the *same* title width, and each cell is right-aligned inside
+/// its column (blank where a row has nothing). Columns that are empty for every
+/// row — or that don't leave room for a title — are dropped from the right.
+fn meta_rows<'a>(inner_w: usize, rows: Vec<RowSpec<'a>>) -> Vec<Line<'a>> {
+    let n_cols = rows.iter().map(|r| r.cells.len()).max().unwrap_or(0);
+    let mut col_w = vec![0usize; n_cols];
+    for r in &rows {
+        for (j, (txt, _)) in r.cells.iter().enumerate() {
+            if !txt.is_empty() {
+                col_w[j] = col_w[j].max(txt.chars().count() + 2); // +2 = gap
+            }
+        }
+    }
+    let prefix_w = rows
+        .iter()
+        .map(|r| r.prefix.iter().map(Span::width).sum::<usize>())
+        .max()
+        .unwrap_or(0);
+
+    // Trim columns from the right until a reasonable title still fits.
+    let mut active = n_cols;
+    while active > 0
+        && prefix_w + col_w[..active].iter().sum::<usize>() + 8 > inner_w
+    {
+        active -= 1;
+    }
+    let meta_w: usize = col_w[..active].iter().sum();
+
+    rows.into_iter()
+        .map(|r| {
+            // Per-row title width so every line still totals `inner_w` (the meta
+            // columns stay aligned) even when prefixes differ in length — the
+            // fuzzy finder indents deeper items.
+            let this_prefix_w: usize = r.prefix.iter().map(Span::width).sum();
+            let title_w = inner_w.saturating_sub(this_prefix_w + meta_w).max(3);
+            let shown = truncate(&r.title, title_w);
+            let pad = title_w.saturating_sub(shown.chars().count());
+            let mut spans = r.prefix;
+            spans.push(Span::styled(shown, r.title_style));
+            spans.push(Span::raw(" ".repeat(pad)));
+            for (j, &w) in col_w.iter().take(active).enumerate() {
+                if w == 0 {
+                    continue; // column empty for every row
+                }
+                let (txt, style) = r.cells.get(j).cloned().unwrap_or_default();
+                spans.push(Span::raw(" ".repeat(w.saturating_sub(txt.chars().count()))));
+                if !txt.is_empty() {
+                    spans.push(Span::styled(txt, style));
+                }
+            }
+            Line::from(spans)
+        })
+        .collect()
+}
+
+/// The compact priority cell: `↑` (high) / `↓` (low), blank for medium.
+fn prio_cell(p: Priority) -> Cell {
+    match p {
+        Priority::High => ("↑".into(), Style::new().fg(red()).bold()),
+        Priority::Low => ("↓".into(), Style::new().fg(blue())),
+        Priority::Medium => (String::new(), Style::default()),
+    }
+}
+
+/// `#a #b` joined for the `i` detail panel.
+fn join_tags(tags: &[String]) -> String {
+    tags.iter()
+        .map(|t| format!("#{t}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The left-hand label span for a row in an `i` detail panel.
+fn info_label(s: &str) -> Span<'static> {
+    Span::styled(format!("   {s:<11}"), Style::new().fg(subtle()))
+}
+
+fn info_row(label: &str, value: String, style: Style) -> Line<'static> {
+    Line::from(vec![info_label(label), Span::styled(value, style)])
+}
+
+/// The inline detail panel shown under a todo when `i` is pressed.
+fn todo_detail_lines(t: &crate::model::Todo, today: NaiveDate) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::from(""),
+        info_row("priority", t.priority.label().to_string(), Style::new().fg(text())),
+    ];
+    if let Some(d) = t.due {
+        lines.push(info_row(
+            "due",
+            format!("{} · {}", d.format("%Y-%m-%d"), rel(d, today)),
+            Style::new().fg(text()),
+        ));
+    }
+    if !t.tags.is_empty() {
+        lines.push(info_row("tags", join_tags(&t.tags), Style::new().fg(blue())));
+    }
+    let (sd, st) = t.subtask_progress();
+    if st > 0 {
+        lines.push(info_row("subtasks", format!("{sd}/{st}"), Style::new().fg(text())));
+    }
+    if !t.note.trim().is_empty() {
+        lines.push(info_row("note", "yes  (n / N)".into(), Style::new().fg(subtle())));
+    }
+    if !t.attachments.is_empty() {
+        lines.push(info_row(
+            "files",
+            format!("{}  (A)", t.attachments.len()),
+            Style::new().fg(subtle()),
+        ));
+    }
+    lines.push(Line::from(""));
+    lines
+}
+
+/// The inline detail panel shown under a subtask when `i` is pressed.
+fn subtask_detail_lines(s: &crate::model::Subtask) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::from(""),
+        info_row("priority", s.priority.label().to_string(), Style::new().fg(text())),
+    ];
+    if !s.tags.is_empty() {
+        lines.push(info_row("tags", join_tags(&s.tags), Style::new().fg(blue())));
+    }
+    if !s.note.trim().is_empty() {
+        lines.push(info_row("note", "yes  (n / N)".into(), Style::new().fg(subtle())));
+    }
+    if !s.attachments.is_empty() {
+        lines.push(info_row(
+            "files",
+            format!("{}  (A)", s.attachments.len()),
+            Style::new().fg(subtle()),
+        ));
+    }
+    lines.push(Line::from(""));
+    lines
 }
 
 fn panel(title: String, focused: bool) -> Block<'static> {
@@ -1804,14 +2101,6 @@ fn hint(text: &str) -> Paragraph<'static> {
         Line::from(Span::styled(format!("  {text}"), Style::new().fg(subtle()))),
     ])
     .wrap(Wrap { trim: false })
-}
-
-fn prio_style(p: Priority) -> Style {
-    match p {
-        Priority::High => Style::new().fg(red()),
-        Priority::Medium => Style::new().fg(yellow()),
-        Priority::Low => Style::new().fg(blue()),
-    }
 }
 
 fn rel(date: NaiveDate, today: NaiveDate) -> String {
@@ -1865,4 +2154,66 @@ fn popup(area: Rect, width: u16, height: u16) -> Rect {
 fn overlay(f: &mut Frame, rect: Rect) {
     f.render_widget(Clear, rect);
     f.render_widget(Block::default().style(Style::new().bg(bg())), rect);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec(title: &str, cells: &[&str]) -> RowSpec<'static> {
+        RowSpec {
+            prefix: vec![Span::raw("○ ")],
+            title: title.to_string(),
+            title_style: Style::default(),
+            cells: cells
+                .iter()
+                .map(|c| (c.to_string(), Style::default()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn meta_rows_keeps_every_row_the_same_width() {
+        // Rows with wildly different content — including one that has *no*
+        // metadata at all — must still line up (this was the "no subtasks looks
+        // weird" bug).
+        let rows = vec![
+            spec("short", &["↑", "⊞1/3", "Sep 01"]),
+            spec("a considerably longer todo title", &["", "", "Sep 09"]),
+            spec("mid length one", &["↓", "", ""]),
+        ];
+        let lines = meta_rows(60, rows);
+        let w0 = lines[0].width();
+        assert!(w0 <= 60);
+        assert!(lines.iter().all(|l| l.width() == w0), "columns stay aligned");
+    }
+
+    #[test]
+    fn meta_rows_drops_columns_when_too_narrow() {
+        let cells = ["↑", "⊞1/3", "¶", "Sep 01"];
+        let wide = meta_rows(60, vec![spec("title", &cells)]);
+        let narrow = meta_rows(18, vec![spec("title", &cells)]);
+        assert!(narrow[0].width() <= 18);
+        assert!(wide[0].width() > narrow[0].width());
+    }
+
+    #[test]
+    fn meta_rows_aligns_meta_with_uneven_prefixes() {
+        // The fuzzy finder indents deeper hits — different prefix widths must
+        // still leave the right-hand column aligned (every row == inner_w).
+        let mk = |prefix: &str, title: &str, crumb: &str| RowSpec {
+            prefix: vec![Span::raw(prefix.to_string())],
+            title: title.to_string(),
+            title_style: Style::default(),
+            cells: vec![(crumb.to_string(), Style::default())],
+        };
+        let lines = meta_rows(
+            50,
+            vec![
+                mk("● ", "Website", ""),
+                mk("    ↳ ", "token refresh", "Website › OAuth"),
+            ],
+        );
+        assert_eq!(lines[0].width(), lines[1].width());
+    }
 }

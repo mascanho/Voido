@@ -3,6 +3,37 @@
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 
+/// Normalise one raw tag: strip a leading `#`, lowercase, keep only
+/// `a-z0-9-_`. Returns `None` for anything that reduces to empty.
+pub fn normalize_tag(raw: &str) -> Option<String> {
+    let t: String = raw
+        .trim()
+        .trim_start_matches('#')
+        .to_lowercase()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    (!t.is_empty()).then_some(t)
+}
+
+/// Normalise a whole set of tags: clean each, drop empties, de-duplicate,
+/// preserving first-seen order.
+pub fn normalize_tags<I, S>(raw: I) -> Vec<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut out: Vec<String> = Vec::new();
+    for r in raw {
+        if let Some(t) = normalize_tag(r.as_ref())
+            && !out.contains(&t)
+        {
+            out.push(t);
+        }
+    }
+    out
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Priority {
@@ -61,6 +92,8 @@ pub struct Subtask {
     pub note: String,
     #[serde(default)]
     pub attachments: Vec<Attachment>,
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 impl Subtask {
@@ -71,6 +104,7 @@ impl Subtask {
             priority: Priority::Medium,
             note: String::new(),
             attachments: Vec::new(),
+            tags: Vec::new(),
         }
     }
 }
@@ -146,6 +180,8 @@ pub struct Todo {
     pub note: String,
     #[serde(default)]
     pub attachments: Vec<Attachment>,
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 impl Todo {
@@ -158,6 +194,7 @@ impl Todo {
             subtasks: Vec::new(),
             note: String::new(),
             attachments: Vec::new(),
+            tags: Vec::new(),
         }
     }
 
@@ -230,6 +267,8 @@ pub struct Project {
     pub notes: Vec<Note>,
     #[serde(default)]
     pub milestones: Vec<Milestone>,
+    #[serde(default)]
+    pub tags: Vec<String>,
     #[serde(default = "default_date")]
     pub created: NaiveDate,
 }
@@ -247,6 +286,7 @@ impl Project {
             todos: Vec::new(),
             notes: Vec::new(),
             milestones: Vec::new(),
+            tags: Vec::new(),
             created: chrono::Local::now().date_naive(),
         }
     }
@@ -434,6 +474,14 @@ mod tests {
         let mut v = [Priority::Low, Priority::High, Priority::Medium];
         v.sort_by_key(|p| p.rank());
         assert_eq!(v, [Priority::High, Priority::Medium, Priority::Low]);
+    }
+
+    #[test]
+    fn normalize_tags_cleans_and_dedupes() {
+        let tags = normalize_tags(["#Frontend", "back end", "frontend", "  ", "ui/ux"]);
+        assert_eq!(tags, vec!["frontend", "backend", "uiux"]);
+        assert_eq!(normalize_tag("###"), None);
+        assert_eq!(normalize_tag("#a-b_1"), Some("a-b_1".to_string()));
     }
 
     #[test]

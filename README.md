@@ -65,8 +65,10 @@ it's reloaded when you close the editor.
 
 Press **`^t`** for the theme picker — `j`/`k` previews live, `enter` keeps it,
 `esc` reverts. The choice is saved as `"theme"` in the settings file, so you can
-also set it there directly. Bundled: Catppuccin (Mocha / Latte), Tokyo Night,
-Dracula, Nord, Gruvbox (Dark / Light), One Dark, Rosé Pine, Solarized
+also set it there directly. 25 are bundled: Catppuccin (Mocha / Macchiato /
+Frappé / Latte), Tokyo Night, Kanagawa, Dracula, Nord, Rosé Pine (+ Moon /
+Dawn), Gruvbox (Dark / Material / Light), Everforest (Dark / Light), One Dark,
+Monokai, Ayu (Dark / Mirage), GitHub (Dark / Light), Zenburn, Solarized
 (Dark / Light).
 
 Add your own in the settings file — they show up in the picker alongside the
@@ -97,14 +99,28 @@ The resolved token also lifts the anonymous rate limit on the repo-activity view
 Each project gets its own icon in the rail (picked from its name, so it's stable
 between runs). The icon's colour is the status: dim = empty, accent = open
 todos, green = everything done — and a finished project's name is struck through.
+Each row shows the todo tally right-aligned (`done/total`, `✓` when complete,
+`·` when empty), dropped when the pane is too narrow.
+
+Every list works the same way: a mark, the title (which flexes to fill the
+width and truncates with `…`), then metadata in **fixed right-hand columns** —
+priority (`↑`/`↓`), subtask progress (`⊞`), note/attachment marks (`¶` `📎`),
+due date. Each column lines up vertically whether or not a given row has a value
+for it, and columns drop out as the pane narrows, so the metadata never gets
+shoved off the edge by a long title and rows never look ragged.
+
+Press **`i`** in the Projects rail, the Todos pane, or the Subtasks pane to open
+a detail panel beneath the selected row — its **tags**, dates, and counts. Each
+pane keeps its own `i` toggle, so expanding todos doesn't also expand the rail.
+`i` again closes it.
 
 ## Layout
 
 ```
- ╭ Projects ─╮╭ Overview  Todos  Notes  Schedule ─── Website ╮╭ Subtasks 1/3 ╮
- │ ◈ Website ││ ○ Design system in Figma   high   Sep 01     ││ ✔ Hero        │
- │ ◆ Voido   ││ ○ Rebuild the home page    med  ⊞ 1/3        ││ ○ Nav+footer  │
- ╰───────────╯╰──────────────────────────────────────────────╯╰──────────────╯
+ ╭ Projects ──────╮╭ Overview  Todos  Notes  Schedule ──── Website ╮╭ Subtasks 1/3 ╮
+ │▍◈ Website  3/8 ││ ○ Design system in Figma        ↑  ⊞2/3    Sep 01││ ✔ Hero       │
+ │ ◆ Voido      ✓ ││ ○ Rebuild the home page              ¶     Sep 09││ ○ Nav+footer │
+ ╰────────────────╯╰──────────────────────────────────────────────╯╰──────────────╯
   NORMAL  TODOS   <status>   context key hints          Website > todos
 ```
 
@@ -138,15 +154,16 @@ time for the full list.
 | Scope | Keys |
 | --- | --- |
 | Global | `h`/`l` switch pane · `w`/`s` prev/next project · `tab`/`S-tab` switch view · `1`‑`4` jump to a view · `gg`/`G` top/bottom · `esc` back out · `/` fuzzy find · `m` minimal view · `^t` theme · `^y` GitHub sync · `^e` edit settings file · `?` help · `q` quit |
-| Projects | `a` add · `r` rename · `d` delete · `l` open · `^g` link/unlink code repo · `o` repo activity |
-| Overview | `e` edit description · `r` rename |
-| Todos | `a` add · `e` edit · `d` delete · `x` (or space) done · `p` priority · `o` sort by priority · `J`/`K` reorder · `l` subtasks · `n` view note · `N` edit note · `A` attachments |
-| Subtasks | `a` add · `e` edit · `d` delete · `x` done · `p` priority · `J`/`K` reorder · `n` view note · `N` edit note · `^d`/`^u` scroll note · `A` attachments · `h` back |
+| Projects | `a` add · `r` rename · `d` delete · `l` open · `i` detail · `t` tags · `^g` link/unlink code repo · `o` repo activity |
+| Overview | `e` edit description · `r` rename · `t` tags |
+| Todos | `a` add · `e` edit · `d` delete · `x` (or space) done · `p` priority · `o` sort by priority · `J`/`K` reorder · `l` subtasks · `i` detail · `n` view note · `N` edit note · `t` tags · `A` attachments |
+| Subtasks | `a` add · `e` edit · `d` delete · `x` done · `p` priority · `J`/`K` reorder · `i` detail · `n` view note · `N` edit note · `t` tags · `A` attachments · `h` back |
+| Tags (`t`) | `a` add one or more (space-separated) · `d` remove the selected tag · `esc` close |
 | Notes | `a` add · `e` edit title · `d` delete · `x` pin · `J`/`K` reorder · `l` open body |
 | Note body | `j`/`k` · `^d`/`^u` scroll · `space` expand · `e` edit · `h` back |
 | MD editor | type freely · `esc` / `^s` save & close |
 | Schedule | `a` add milestone · `e`/`d` edit/delete · `x` done · `r` reschedule · `f` cycle filter · `l` jump to todo |
-| Find (`/`) | type to filter projects, todos & notes · `↑`/`↓` or `^n`/`^p` move · `enter` jump · `esc` cancel |
+| Find (`/`) | fuzzy-match projects, todos, subtasks, notes & their tags — each hit shows its type glyph, indent depth, and `project › todo` path · `↑`/`↓` or `^n`/`^p` move · `enter` jump · `esc` cancel |
 | Attachments (`A`) | `a` add a URL or path (append `\| label` to name it) · `o`/`enter` open with the system opener · `d` remove · `esc` close |
 
 ### Quick-add syntax
@@ -154,10 +171,19 @@ time for the full list.
 When adding or editing a todo:
 
 ```
-ship the release !3 @2026-09-15
+ship the release !3 @2026-09-15 #release #frontend
 ```
 
 - `!1` `!2` `!3` — priority (low / med / high)
 - `@YYYY-MM-DD` — due date
+- `#tag` — a tag (lower-cased, `a-z0-9-_`); repeatable
+
+Subtasks take `!priority` and `#tag`; adding or renaming a **project** takes
+`#tag` too (`Website Redesign #web`). Tags aren't shown on the row — press `i`
+for the detail panel — and `/` search matches them.
+
+To manage tags **after** creating something, press **`t`** on the selected
+project / todo / subtask (or from the Overview) — a small panel where `a` adds
+one or more space-separated tags and `d` removes the highlighted one.
 
 For milestones, add `@YYYY-MM-DD` for the date (defaults to today).

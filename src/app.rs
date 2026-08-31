@@ -159,6 +159,10 @@ pub enum InputAction {
     EditMilestone(usize),
     RescheduleTodo(usize),
     RescheduleMilestone(usize),
+    /// Write the whole store to a JSON file at this path.
+    ExportData,
+    /// Load a JSON file at this path; on success, confirm before replacing.
+    ImportData,
     LinkRepo,
     /// GitHub data-sync setup: repo, then token.
     SyncRepo,
@@ -186,6 +190,8 @@ pub enum ConfirmAction {
     DeleteMilestone(usize),
     /// `q` — guard against an accidental quit.
     Quit,
+    /// Replace the entire store with a dataset loaded from a file.
+    ImportData(Box<Store>),
 }
 
 pub struct ConfirmState {
@@ -294,6 +300,28 @@ pub struct SearchHit {
     /// Ancestor names, outermost first — `[]` for a project, `[project]` for a
     /// todo/note, `[project, todo]` for a subtask.
     pub crumbs: Vec<String>,
+    /// A dim summary of what the hit contains — `Some("8 todos · 2 overdue")` on
+    /// a project, `Some("↳ 2/5")` on a todo that has subtasks, `None` otherwise.
+    pub context: Option<String>,
+}
+
+/// One-line summary of a project's workload, shown on its fuzzy-search hit.
+fn project_search_context(p: &Project) -> String {
+    let total = p.todos.len();
+    if total == 0 {
+        return "no todos".to_string();
+    }
+    let today = Local::now().date_naive();
+    let overdue = p
+        .todos
+        .iter()
+        .filter(|t| !t.done && t.due.is_some_and(|d| d < today))
+        .count();
+    let mut s = format!("{total} todo{}", if total == 1 { "" } else { "s" });
+    if overdue > 0 {
+        s.push_str(&format!(" · {overdue} overdue"));
+    }
+    s
 }
 
 /// Theme picker. Moving the cursor previews the theme live; `esc` restores the
@@ -323,8 +351,45 @@ pub enum Mode {
     Tags(TagState),
     /// Links found in the note currently on screen (`L`).
     Links(LinksState),
+    /// The main menu (`^k`) — a hub for the global actions.
+    Menu(MenuState),
     /// Global fuzzy finder.
     Search(Box<SearchState>),
+}
+
+/// One entry in the `^k` main menu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuAction {
+    SaveNow,
+    Sync,
+    Export,
+    Import,
+    Settings,
+    Theme,
+    Weather,
+    Activity,
+    Help,
+    Quit,
+}
+
+impl MenuAction {
+    /// The menu, top to bottom: `(action, glyph, label, key hint)`.
+    pub const ENTRIES: &'static [(MenuAction, &'static str, &'static str, &'static str)] = &[
+        (MenuAction::SaveNow, "\u{f0c7}", "Save now", ""),
+        (MenuAction::Sync, "\u{f09b}", "Sync to GitHub", "^s"),
+        (MenuAction::Export, "\u{f0ee}", "Export data…", ""),
+        (MenuAction::Import, "\u{f019}", "Import data…", ""),
+        (MenuAction::Settings, "\u{f013}", "Settings", "^e"),
+        (MenuAction::Theme, "\u{f043}", "Theme", "^t"),
+        (MenuAction::Weather, "\u{f0c2}", "Weather", "^w"),
+        (MenuAction::Activity, "\u{f085}", "Activity log", "^l"),
+        (MenuAction::Help, "\u{f059}", "Keybindings", "?"),
+        (MenuAction::Quit, "\u{f011}", "Quit", "q"),
+    ];
+}
+
+pub struct MenuState {
+    pub sel: usize,
 }
 
 pub struct App {
@@ -431,16 +496,7 @@ impl App {
         // Tidy whatever we loaded (local DB, legacy import or GitHub sync):
         // enforce "todo with subtasks is done iff they all are", and normalise
         // any hand-edited tags.
-        for p in &mut store.projects {
-            p.tags = crate::model::normalize_tags(p.tags.drain(..));
-            for t in &mut p.todos {
-                t.recompute_done();
-                t.tags = crate::model::normalize_tags(t.tags.drain(..));
-                for s in &mut t.subtasks {
-                    s.tags = crate::model::normalize_tags(s.tags.drain(..));
-                }
-            }
-        }
+        heal_store(&mut store);
         let gh_client = GitHubClient::new(sync_token.clone());
         Self {
             store,
@@ -1072,6 +1128,7 @@ impl App {
             Mode::Attach(_) => self.handle_attach(key),
             Mode::Tags(_) => self.handle_tags(key),
             Mode::Links(_) => self.handle_links(key),
+            Mode::Menu(_) => self.handle_menu(key),
             Mode::Search(_) => self.handle_search(key),
             Mode::Help | Mode::GitHub | Mode::Weather | Mode::Notice(..) => {
                 self.mode = Mode::Normal
@@ -1205,20 +1262,8 @@ impl App {
                 KeyCode::Char('s') => self.sync_action(),
                 KeyCode::Char('e') => self.open_settings = true,
                 KeyCode::Char('t') => self.open_theme(),
-                KeyCode::Char('w') => {
-                    if self.weather.is_some() {
-                        self.mode = Mode::Weather;
-                    } else if self
-                        .config
-                        .weather
-                        .as_deref()
-                        .is_some_and(|s| !s.trim().is_empty())
-                    {
-                        self.status = "weather — still loading…".into();
-                    } else {
-                        self.status = "set `weather` in config (^e) to enable it".into();
-                    }
-                }
+                KeyCode::Char('k') => self.mode = Mode::Menu(MenuState { sel: 0 }),
+                KeyCode::Char('w') => self.open_weather(),
                 KeyCode::Char('l') => {
                     self.activity_open = !self.activity_open;
                     self.status = if self.activity_open {
@@ -2178,6 +2223,133 @@ impl App {
         self.status = "no clipboard tool found (pbcopy / wl-copy / xclip / xsel)".into();
     }
 
+    // ---- main menu (`^k`) ------------------------------------
+
+    /// Open the weather modal, or explain why it's empty. Shared by `^w` and the
+    /// menu.
+    fn open_weather(&mut self) {
+        if self.weather.is_some() {
+            self.mode = Mode::Weather;
+        } else if self
+            .config
+            .weather
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty())
+        {
+            self.status = "weather — still loading…".into();
+        } else {
+            self.status = "set `weather` in config (^e) to enable it".into();
+        }
+    }
+
+    fn handle_menu(&mut self, key: KeyEvent) {
+        let Mode::Menu(state) = &mut self.mode else {
+            return;
+        };
+        let len = MenuAction::ENTRIES.len();
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.mode = Mode::Normal,
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.should_quit = true
+            }
+            KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.mode = Mode::Normal
+            }
+            KeyCode::Char('j') | KeyCode::Down => state.sel = step(state.sel, 1, len),
+            KeyCode::Char('k') | KeyCode::Up => state.sel = step(state.sel, -1, len),
+            KeyCode::Char('g') | KeyCode::Home => state.sel = 0,
+            KeyCode::Char('G') | KeyCode::End => state.sel = len - 1,
+            KeyCode::Enter | KeyCode::Char('l') | KeyCode::Char(' ') => {
+                let action = MenuAction::ENTRIES[state.sel].0;
+                self.mode = Mode::Normal;
+                self.run_menu(action);
+            }
+            _ => {}
+        }
+    }
+
+    fn run_menu(&mut self, action: MenuAction) {
+        match action {
+            MenuAction::SaveNow => {
+                self.dirty = true;
+                self.status = "saved".into();
+            }
+            MenuAction::Sync => self.sync_action(),
+            MenuAction::Export => {
+                let path = default_export_path();
+                self.begin_input("Export data — file path", path, InputAction::ExportData);
+            }
+            MenuAction::Import => self.begin_input(
+                "Import data — file path (replaces everything)",
+                String::new(),
+                InputAction::ImportData,
+            ),
+            MenuAction::Settings => self.open_settings = true,
+            MenuAction::Theme => self.open_theme(),
+            MenuAction::Weather => self.open_weather(),
+            MenuAction::Activity => {
+                self.activity_open = !self.activity_open;
+                self.status = if self.activity_open {
+                    "activity panel — ^l to hide".into()
+                } else {
+                    String::new()
+                };
+            }
+            MenuAction::Help => self.mode = Mode::Help,
+            MenuAction::Quit => {
+                self.mode = Mode::Confirm(ConfirmState {
+                    prompt: "Quit voido?".into(),
+                    action: ConfirmAction::Quit,
+                });
+            }
+        }
+    }
+
+    fn do_export(&mut self, raw_path: &str) {
+        let path = expand_tilde(raw_path);
+        let json = match serde_json::to_string_pretty(&self.store) {
+            Ok(j) => j,
+            Err(e) => {
+                self.toast(ToastKind::Error, format!("export failed: {e}"));
+                return;
+            }
+        };
+        match std::fs::write(&path, json) {
+            Ok(()) => {
+                self.push_log(format!("exported data to {}", path.display()));
+                self.toast(
+                    ToastKind::Success,
+                    format!("Exported to {}", truncate(&path.to_string_lossy(), 48)),
+                );
+            }
+            Err(e) => self.toast(ToastKind::Error, format!("export failed: {e}")),
+        }
+    }
+
+    fn do_import(&mut self, raw_path: &str) {
+        let path = expand_tilde(raw_path);
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(r) => r,
+            Err(e) => {
+                self.toast(ToastKind::Error, format!("can't read that file: {e}"));
+                return;
+            }
+        };
+        match serde_json::from_str::<Store>(&raw) {
+            Ok(store) => {
+                let n = store.projects.len();
+                self.mode = Mode::Confirm(ConfirmState {
+                    prompt: format!(
+                        "Replace ALL data with {n} project{} from this file?",
+                        if n == 1 { "" } else { "s" }
+                    ),
+                    action: ConfirmAction::ImportData(Box::new(store)),
+                });
+            }
+            Err(e) => self.toast(ToastKind::Error, format!("not valid voido data: {e}")),
+        }
+    }
+
     // ---- fuzzy finder -----------------------------------------
 
     fn open_search(&mut self) {
@@ -2197,7 +2369,11 @@ impl App {
         for (pi, p) in self.store.projects.iter().enumerate() {
             // `hay` is matched against; `label` is what the result shows; `crumbs`
             // are the ancestor names. Tags fold into the haystack.
-            let mut consider = |label: &str, hay: &str, target: SearchTarget, crumbs: Vec<String>| {
+            let mut consider = |label: &str,
+                                hay: &str,
+                                target: SearchTarget,
+                                crumbs: Vec<String>,
+                                context: Option<String>| {
                 let score = if q.is_empty() {
                     Some(0)
                 } else {
@@ -2213,6 +2389,7 @@ impl App {
                             target,
                             label: label.to_string(),
                             crumbs,
+                            context,
                         },
                     ));
                 }
@@ -2229,13 +2406,17 @@ impl App {
                 &with_tags(&p.name, &p.tags),
                 SearchTarget::Project,
                 vec![],
+                Some(project_search_context(p)),
             );
             for (ti, t) in p.todos.iter().enumerate() {
+                let (sd, st) = t.subtask_progress();
+                let todo_ctx = (st > 0).then(|| format!("↳ {sd}/{st}"));
                 consider(
                     &t.title,
                     &with_tags(&t.title, &t.tags),
                     SearchTarget::Todo(ti),
                     vec![p.name.clone()],
+                    todo_ctx,
                 );
                 if !q.is_empty() {
                     for (si, s) in t.subtasks.iter().enumerate() {
@@ -2244,12 +2425,19 @@ impl App {
                             &with_tags(&s.title, &s.tags),
                             SearchTarget::Subtask { todo: ti, sub: si },
                             vec![p.name.clone(), t.title.clone()],
+                            None,
                         );
                     }
                 }
             }
             for (ni, n) in p.notes.iter().enumerate() {
-                consider(&n.text, &n.text, SearchTarget::Note(ni), vec![p.name.clone()]);
+                consider(
+                    &n.text,
+                    &n.text,
+                    SearchTarget::Note(ni),
+                    vec![p.name.clone()],
+                    None,
+                );
             }
         }
         // Highest score first; stable on insertion order for ties / empty query.
@@ -2768,6 +2956,20 @@ impl App {
                     self.status = format!("rescheduled to {}", date.format("%Y-%m-%d"));
                 }
             }
+            InputAction::ExportData => {
+                if value.trim().is_empty() {
+                    self.status = "export cancelled".into();
+                } else {
+                    self.do_export(value.trim());
+                }
+            }
+            InputAction::ImportData => {
+                if value.trim().is_empty() {
+                    self.status = "import cancelled".into();
+                } else {
+                    self.do_import(value.trim());
+                }
+            }
             InputAction::LinkRepo => {
                 let value = value.trim().to_string();
                 if value.is_empty() {
@@ -2886,6 +3088,25 @@ impl App {
                 self.status = "milestone deleted".into();
             }
             ConfirmAction::Quit => self.should_quit = true,
+            ConfirmAction::ImportData(store) => {
+                let mut store = *store;
+                let n = store.projects.len();
+                heal_store(&mut store);
+                self.store = store;
+                self.project_idx = 0;
+                self.todo_idx = 0;
+                self.subtask_idx = 0;
+                self.note_idx = 0;
+                self.reset_content_idx();
+                self.focus = Focus::Projects;
+                self.tab = Tab::Todos;
+                self.dirty = true;
+                self.push_log(format!("imported {n} project(s)"));
+                self.toast(
+                    ToastKind::Success,
+                    format!("Imported {n} project{}", if n == 1 { "" } else { "s" }),
+                );
+            }
         }
     }
 
@@ -3121,6 +3342,40 @@ fn step(idx: usize, delta: i32, len: usize) -> usize {
     }
     let max = len as i32 - 1;
     (idx as i32 + delta).clamp(0, max) as usize
+}
+
+/// Normalise a freshly loaded store: keep every todo's `done` in lockstep with
+/// its subtasks and clean any hand-edited tags. Run on startup and after import.
+fn heal_store(store: &mut Store) {
+    for p in &mut store.projects {
+        p.tags = crate::model::normalize_tags(p.tags.drain(..));
+        for t in &mut p.todos {
+            t.recompute_done();
+            t.tags = crate::model::normalize_tags(t.tags.drain(..));
+            for s in &mut t.subtasks {
+                s.tags = crate::model::normalize_tags(s.tags.drain(..));
+            }
+        }
+    }
+}
+
+/// Expand a leading `~` to the home directory.
+fn expand_tilde(path: &str) -> std::path::PathBuf {
+    if let Some(rest) = path.strip_prefix("~/")
+        && let Some(home) = dirs::home_dir()
+    {
+        return home.join(rest);
+    }
+    std::path::PathBuf::from(path)
+}
+
+/// `~/voido-export-YYYY-MM-DD.json`, or a bare filename if there's no home dir.
+fn default_export_path() -> String {
+    let name = format!("voido-export-{}.json", Local::now().format("%Y-%m-%d"));
+    match dirs::home_dir() {
+        Some(home) => home.join(name).to_string_lossy().into_owned(),
+        None => name,
+    }
 }
 
 /// A `#tag` token: `#` followed by a letter (so issue refs like `#42` stay in
@@ -3455,6 +3710,23 @@ mod tests {
         let mut v = [Priority::High, Priority::Medium, Priority::Low];
         v.sort_by_key(|p| priority_sort_key(*p, Priority::Low));
         assert_eq!(v, [Priority::Low, Priority::High, Priority::Medium]);
+    }
+
+    #[test]
+    fn project_search_context_counts_todos_and_overdue() {
+        let today = Local::now().date_naive();
+        let mut p = Project::new("Juriba");
+        assert_eq!(project_search_context(&p), "no todos");
+
+        p.todos.push(Todo::new("a"));
+        let mut b = Todo::new("b");
+        b.due = Some(today - chrono::Duration::days(2));
+        p.todos.push(b);
+        let mut c = Todo::new("c");
+        c.due = Some(today - chrono::Duration::days(1));
+        c.done = true; // overdue but done -> not counted
+        p.todos.push(c);
+        assert_eq!(project_search_context(&p), "3 todos · 1 overdue");
     }
 
     #[test]

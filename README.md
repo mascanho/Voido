@@ -149,6 +149,16 @@ than sticking in the footer; the full history is in the `^l` panel.
 The middle pane's tabs live on its top border. Left rail is the project list;
 the right pane shows subtasks (Todos) or the note body (Notes).
 
+Press **`^k`** for the main menu — a single list of the global actions: **Save
+now**, **Sync to GitHub**, **Export data…**, **Import data…**, **Settings**,
+**Theme**, **Weather**, **Activity log**, **Keybindings** and **Quit**. `j`/`k`
+move, `enter` runs the highlighted item, `esc` closes.
+
+- **Export** writes your whole dataset to a JSON file (defaults to
+  `~/voido-export-<date>.json`; edit the path before pressing enter).
+- **Import** reads a JSON file and, after a `y`/`n` confirm, **replaces
+  everything** with its contents — the same format Export and GitHub sync use.
+
 Press **`^l`** for the activity panel — a strip below the panes with two tables:
 **Logs** (app events: startup, sync, settings reloads, errors) and **Changes**
 (every data edit you've made this session, newest at the bottom). Session-only,
@@ -188,7 +198,7 @@ time for the full list.
 
 | Scope | Keys |
 | --- | --- |
-| Global | `h`/`l` switch pane · `w`/`s` prev/next project · `tab`/`S-tab` switch view · `1`‑`4` jump to a view · `gg`/`G` top/bottom · `esc` back out · `/` fuzzy find · `m` minimal view · `^l` activity panel · `^w` weather · `^t` theme · `^s` save to GitHub · `^e` edit settings file · `?` help · `q` quit (asks to confirm — `qq`, `y` or `enter`; `^c` quits straight away) |
+| Global | `h`/`l` switch pane · `w`/`s` prev/next project · `tab`/`S-tab` switch view · `1`‑`4` jump to a view · `gg`/`G` top/bottom · `esc` back out · `/` fuzzy find · `m` minimal view · `^k` main menu · `^l` activity panel · `^w` weather · `^t` theme · `^s` save to GitHub · `^e` edit settings file · `?` help · `q` quit (asks to confirm — `qq`, `y` or `enter`; `^c` quits straight away) |
 | Projects | `a` add · `r` rename · `d` delete · `l` open · `i` detail · `t` tags · `^g` link/unlink code repo · `o` repo activity |
 | Overview | `e` edit description · `r` rename · `t` tags |
 | Todos | `a` add · `e` edit · `d` delete · `x` (or space) done · `p` priority · `o` sort by priority (cycles High/Med/Low on top) · `J`/`K` reorder · `l` subtasks · `i` detail · `n` view note · `N` edit note · `t` tags · `A` attachments |
@@ -198,7 +208,7 @@ time for the full list.
 | Note body | `j`/`k` · `^d`/`^u` scroll · `space` expand · `e` edit · `h` back |
 | MD editor | type freely · `esc` / `^s` save & close |
 | Schedule | `a` add milestone · `e`/`d` edit/delete · `x` done · `r` reschedule · `f` cycle filter · `l` jump to todo |
-| Find (`/`) | fuzzy-match projects, todos, subtasks, notes & their tags — each hit shows its type glyph, indent depth, and `project › todo` path · `↑`/`↓` or `^n`/`^p` move · `enter` jump · `esc` cancel |
+| Find (`/`) | fuzzy-match projects, todos, subtasks, notes & their tags — each hit shows its type glyph, indent depth, and `project › todo` path; a project hit also shows its todo count (`8 todos · 2 overdue`, overdue in red) and a todo hit its subtask progress (`↳ 2/5`) · `↑`/`↓` or `^n`/`^p` move · `enter` jump · `esc` cancel |
 | Attachments (`A`) | `a` add a URL or path (append `\| label` to name it) · `o`/`enter` open with the system opener · `d` remove · `esc` close |
 
 ### Quick-add syntax

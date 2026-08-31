@@ -14,8 +14,8 @@ use ratatui::{
 
 use crate::app::{
     App, AttachState, ConfirmAction, ConfirmState, DetailNote, EditTarget, Focus, InputState,
-    LinksState, LogEntry, Mode, PaneRects, SearchState, SearchTarget, Tab, TagState, TagTarget,
-    ThemeState, TlKind, Toast, ToastKind,
+    LinksState, LogEntry, MenuAction, MenuState, Mode, PaneRects, SearchState, SearchTarget, Tab,
+    TagState, TagTarget, ThemeState, TlKind, Toast, ToastKind,
 };
 use crate::model::{AttachmentKind, Priority};
 use crate::theme::{accent, bg, blue, border, green, on_accent, red, sel_bg, subtle, text, yellow};
@@ -118,6 +118,7 @@ pub fn render(f: &mut Frame, app: &App) {
         Mode::Attach(state) => render_attach(f, area, state, app),
         Mode::Tags(state) => render_tags(f, area, state, app),
         Mode::Links(state) => render_links(f, area, state),
+        Mode::Menu(state) => render_menu(f, area, state),
         Mode::Search(state) => render_search(f, area, state, app),
         Mode::EditBody(_) => {}
         Mode::Normal => {}
@@ -1221,7 +1222,8 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
         | Mode::Theme(_)
         | Mode::Attach(_)
         | Mode::Tags(_)
-        | Mode::Links(_) => ("N", accent()),
+        | Mode::Links(_)
+        | Mode::Menu(_) => ("N", accent()),
     };
     let pane_label = match app.focus {
         Focus::Projects => "PROJECTS",
@@ -1586,6 +1588,7 @@ fn render_help(f: &mut Frame, area: Rect) {
         ("m", "minimal view"),
         ("", ""),
         ("", "SYSTEM"),
+        ("^k", "main menu"),
         ("?  q", "help · quit (asks; ^c skips)"),
         ("^t  ^e", "theme · edit settings"),
         ("^s  ^g", "save to GitHub · link repo"),
@@ -2137,11 +2140,22 @@ fn render_search(f: &mut Frame, area: Rect, state: &SearchState, app: &App) {
                     Style::new().fg(subtle()),
                 )
             };
+            let context = match &h.context {
+                Some(c) => (
+                    truncate(c, crumb_max),
+                    Style::new().fg(if c.contains("overdue") {
+                        red()
+                    } else {
+                        subtle()
+                    }),
+                ),
+                None => (String::new(), Style::default()),
+            };
             RowSpec {
                 prefix: vec![Span::styled(format!("{indent}{glyph} "), gstyle)],
                 title: h.label.clone(),
                 title_style: Style::new().fg(text()),
-                cells: vec![crumbs],
+                cells: vec![context, crumbs],
             }
         })
         .collect();
@@ -2174,6 +2188,52 @@ fn render_search(f: &mut Frame, area: Rect, state: &SearchState, app: &App) {
         )),
         rows[3],
     );
+}
+
+/// The `^k` main menu: a hub for the global actions.
+fn render_menu(f: &mut Frame, area: Rect, state: &MenuState) {
+    let entries = MenuAction::ENTRIES;
+    let width = area.width.saturating_sub(6).clamp(30, 44);
+    let height = (entries.len() as u16 + 4).min(area.height.saturating_sub(2));
+    let rect = popup(area, width, height);
+    overlay(f, rect);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(accent()))
+        .title(Span::styled(" Menu ", Style::new().fg(accent()).bold()))
+        .title(
+            Line::from(Span::styled(
+                " enter · esc close ",
+                Style::new().fg(subtle()),
+            ))
+            .right_aligned(),
+        )
+        .padding(Padding::symmetric(2, 1));
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    let hint_w = entries.iter().map(|e| e.3.len()).max().unwrap_or(0);
+    let label_w = (inner.width as usize).saturating_sub(4 + hint_w + 1);
+    let items: Vec<ListItem> = entries
+        .iter()
+        .map(|(_, glyph, label, hint)| {
+            let label_txt = format!("{:<label_w$}", truncate(label, label_w.max(4)));
+            ListItem::new(Line::from(vec![
+                Span::styled(format!("{glyph}  "), Style::new().fg(accent())),
+                Span::styled(label_txt, Style::new().fg(text())),
+                Span::styled(format!(" {hint:>hint_w$}"), Style::new().fg(subtle())),
+            ]))
+        })
+        .collect();
+
+    let list = List::new(items)
+        .highlight_style(Style::new().bg(sel_bg()).bold())
+        .highlight_symbol("▍");
+    let mut ls = ListState::default();
+    ls.select(Some(state.sel.min(entries.len().saturating_sub(1))));
+    f.render_stateful_widget(list, inner, &mut ls);
 }
 
 // ---- helpers -------------------------------------------------------

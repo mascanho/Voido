@@ -45,6 +45,32 @@ pub struct LogEntry {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToastKind {
+    Info,
+    Success,
+    Error,
+}
+
+/// A transient corner notification ("sonner") that fades on its own after a few
+/// seconds. Used for sync results and other one-off events that don't warrant a
+/// modal or a permanent footer badge.
+#[derive(Debug, Clone)]
+pub struct Toast {
+    pub kind: ToastKind,
+    pub text: String,
+    born: Instant,
+}
+
+impl Toast {
+    /// How long a toast stays on screen.
+    const TTL: std::time::Duration = std::time::Duration::from_secs(4);
+
+    fn expired(&self) -> bool {
+        self.born.elapsed() >= Self::TTL
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     Overview,
     Todos,
@@ -152,13 +178,14 @@ impl InputState {
     }
 }
 
-#[allow(clippy::enum_variant_names)]
 pub enum ConfirmAction {
     DeleteProject(usize),
     DeleteTodo(usize),
     DeleteSubtask(usize),
     DeleteNote(usize),
     DeleteMilestone(usize),
+    /// `q` — guard against an accidental quit.
+    Quit,
 }
 
 pub struct ConfirmState {
@@ -217,6 +244,13 @@ pub enum TagTarget {
 /// The tag manager overlay.
 pub struct TagState {
     pub target: TagTarget,
+    pub sel: usize,
+}
+
+/// The "links in this note" overlay (`L`). Items are `(label, url)`, captured
+/// from the markdown that was on screen when it opened.
+pub struct LinksState {
+    pub items: Vec<(String, String)>,
     pub sel: usize,
 }
 
@@ -287,6 +321,8 @@ pub enum Mode {
     Attach(AttachState),
     /// Tag manager for the current project / todo / subtask.
     Tags(TagState),
+    /// Links found in the note currently on screen (`L`).
+    Links(LinksState),
     /// Global fuzzy finder.
     Search(Box<SearchState>),
 }
@@ -328,6 +364,8 @@ pub struct App {
     pub changes: Vec<LogEntry>,
     /// Last status text folded into `logs`/`changes`, so each message lands once.
     last_activity_status: String,
+    /// Transient corner notification, cleared by `tick_toast` once it's old.
+    pub toast: Option<Toast>,
     pub timeline_idx: usize,
     pub deadline_filter: DeadlineFilter,
     /// Which priority the last `o` press floated to the top. `o` cycles it
@@ -427,6 +465,7 @@ impl App {
             logs: Vec::new(),
             changes: Vec::new(),
             last_activity_status: String::new(),
+            toast: None,
             timeline_idx: 0,
             deadline_filter: DeadlineFilter::All,
             prio_sort: None,
@@ -498,6 +537,11 @@ impl App {
                 self.status.clone()
             };
             push_capped(&mut self.changes, text);
+            // The Changes table is the record now; keep it out of the footer
+            // unless it's an error the user must see.
+            if !self.status.starts_with("save error") {
+                self.status.clear();
+            }
         } else if !self.status.is_empty() && self.status != self.last_activity_status {
             push_capped(&mut self.logs, self.status.clone());
         }
@@ -508,6 +552,25 @@ impl App {
     /// that never touch the status line).
     pub fn push_log(&mut self, text: impl Into<String>) {
         push_capped(&mut self.logs, text.into());
+    }
+
+    /// Raise a transient corner notification.
+    pub fn toast(&mut self, kind: ToastKind, text: impl Into<String>) {
+        self.toast = Some(Toast {
+            kind,
+            text: text.into(),
+            born: Instant::now(),
+        });
+    }
+
+    /// Drop the toast once it's outlived its TTL. Returns `true` if it changed.
+    pub fn tick_toast(&mut self) -> bool {
+        if self.toast.as_ref().is_some_and(Toast::expired) {
+            self.toast = None;
+            true
+        } else {
+            false
+        }
     }
 
     /// Markdown-render a note body, reusing the last result when the content and
@@ -566,6 +629,7 @@ impl App {
                 Ok(result) => {
                     self.sync_rx = None;
                     self.sync_in_flight = false;
+                    self.status.clear(); // wipe the lingering "syncing…" line
                     match result {
                         Ok(ok) => {
                             self.sync_sha = Some(ok.sha);
@@ -575,10 +639,11 @@ impl App {
                                 self.config.github_repo = Some(ok.repo);
                                 let _ = self.config.save();
                             }
-                            self.status = "synced with GitHub".into();
+                            self.push_log("synced with GitHub");
+                            self.toast(ToastKind::Success, "Synced with GitHub");
                         }
                         Err(e) => {
-                            self.status = "sync failed".into();
+                            self.push_log(format!("sync failed: {e}"));
                             let repo = self.config.github_repo.clone().unwrap_or_default();
                             self.mode = Mode::Notice(
                                 "GitHub sync failed".into(),
@@ -592,7 +657,8 @@ impl App {
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.sync_rx = None;
                     self.sync_in_flight = false;
-                    self.status = "sync failed".into();
+                    self.push_log("sync failed");
+                    self.toast(ToastKind::Error, "GitHub sync failed");
                     changed = true;
                 }
             }
@@ -1005,6 +1071,7 @@ impl App {
             Mode::Theme(_) => self.handle_theme(key),
             Mode::Attach(_) => self.handle_attach(key),
             Mode::Tags(_) => self.handle_tags(key),
+            Mode::Links(_) => self.handle_links(key),
             Mode::Search(_) => self.handle_search(key),
             Mode::Help | Mode::GitHub | Mode::Weather | Mode::Notice(..) => {
                 self.mode = Mode::Normal
@@ -1024,22 +1091,30 @@ impl App {
         match me.kind {
             MouseEventKind::Down(MouseButton::Left) => self.click_pane(pos),
             MouseEventKind::ScrollDown => {
-                if self.sub_note_focus && self.showing_sub_note() {
-                    self.scroll_detail_note(3);
-                } else {
-                    self.move_sel(3);
-                }
+                self.wheel_scroll(pos, 3);
                 true
             }
             MouseEventKind::ScrollUp => {
-                if self.sub_note_focus && self.showing_sub_note() {
-                    self.scroll_detail_note(-3);
-                } else {
-                    self.move_sel(-3);
-                }
+                self.wheel_scroll(pos, -3);
                 true
             }
             _ => false,
+        }
+    }
+
+    /// Route a wheel tick: scroll a note pane when the pointer is over one that's
+    /// showing (or the sub-note pane has focus), otherwise move the selection.
+    fn wheel_scroll(&mut self, pos: Position, delta: i32) {
+        let over_detail = {
+            let r = self.pane_rects.borrow();
+            r.detail.area() > 0 && r.detail.contains(pos)
+        };
+        let scroll_note = (self.sub_note_focus && self.showing_sub_note())
+            || (over_detail && (self.showing_todo_note() || self.showing_sub_note()));
+        if scroll_note {
+            self.scroll_detail_note(delta);
+        } else {
+            self.move_sel(delta);
         }
     }
 
@@ -1065,6 +1140,12 @@ impl App {
 
         // The detail pane, when one is on screen.
         if r.detail.area() > 0 && r.detail.contains(pos) && self.detail_available() {
+            // The todo's note is filling this pane — a click there must not
+            // dismiss it (it drops out the moment focus moves to Detail). Leave
+            // everything alone so the text stays put to be selected / copied.
+            if self.showing_todo_note() {
+                return false;
+            }
             self.focus = Focus::Detail;
             if self.tab == Tab::Todos {
                 let len = self.current_todo().map(|t| t.subtasks.len()).unwrap_or(0);
@@ -1172,9 +1253,15 @@ impl App {
         let g_pending = std::mem::replace(&mut self.pending_g, false);
 
         match key.code {
-            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('q') => {
+                self.mode = Mode::Confirm(ConfirmState {
+                    prompt: "Quit voido?".into(),
+                    action: ConfirmAction::Quit,
+                });
+            }
             KeyCode::Char('?') => self.mode = Mode::Help,
             KeyCode::Char('/') => self.open_search(),
+            KeyCode::Char('L') => self.open_links(),
             KeyCode::Char('m') => {
                 self.minimal = !self.minimal;
                 self.status = if self.minimal {
@@ -1987,6 +2074,110 @@ impl App {
         }
     }
 
+    // ---- links in a note -------------------------------------
+
+    /// The markdown text currently visible in a note pane, if any.
+    fn current_markdown(&self) -> Option<&str> {
+        match self.tab {
+            Tab::Notes => self.current_note().map(|n| n.body.as_str()),
+            Tab::Todos if self.showing_sub_note() => self
+                .current_todo()
+                .and_then(|t| t.subtasks.get(self.subtask_idx))
+                .map(|s| s.note.as_str()),
+            Tab::Todos if self.showing_todo_note() => {
+                self.current_todo().map(|t| t.note.as_str())
+            }
+            _ => None,
+        }
+    }
+
+    /// `L` — pull every link out of the note on screen so it can be opened or
+    /// copied.
+    fn open_links(&mut self) {
+        let Some(md) = self.current_markdown() else {
+            self.status = "no note on screen — press n on a todo/subtask, or open the Notes tab".into();
+            return;
+        };
+        let items = crate::md::extract_links(md);
+        if items.is_empty() {
+            self.status = "no links in this note".into();
+            return;
+        }
+        self.mode = Mode::Links(LinksState { items, sel: 0 });
+    }
+
+    fn handle_links(&mut self, key: KeyEvent) {
+        let Mode::Links(state) = &self.mode else {
+            return;
+        };
+        let (sel, len) = (state.sel, state.items.len());
+        let url = |app: &Self| -> Option<String> {
+            match &app.mode {
+                Mode::Links(s) => s.items.get(s.sel).map(|(_, u)| u.clone()),
+                _ => None,
+            }
+        };
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('h') => self.mode = Mode::Normal,
+            KeyCode::Char('j') | KeyCode::Down => {
+                if let Mode::Links(s) = &mut self.mode {
+                    s.sel = step(sel, 1, len);
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if let Mode::Links(s) = &mut self.mode {
+                    s.sel = step(sel, -1, len);
+                }
+            }
+            KeyCode::Char('y') | KeyCode::Char('c') => {
+                if let Some(u) = url(self) {
+                    self.copy_to_clipboard(&u);
+                }
+            }
+            KeyCode::Char('o') | KeyCode::Char('l') | KeyCode::Enter => {
+                if let Some(u) = url(self) {
+                    self.open_external(&u);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Pipe `text` to the platform clipboard tool. Best-effort; reports via the
+    /// status line.
+    fn copy_to_clipboard(&mut self, text: &str) {
+        use std::io::Write;
+        let attempts: Vec<Vec<&str>> = if cfg!(target_os = "macos") {
+            vec![vec!["pbcopy"]]
+        } else if cfg!(target_os = "windows") {
+            vec![vec!["clip"]]
+        } else {
+            vec![
+                vec!["wl-copy"],
+                vec!["xclip", "-selection", "clipboard"],
+                vec!["xsel", "--clipboard", "--input"],
+            ]
+        };
+        for cmd in &attempts {
+            let (prog, args) = cmd.split_first().expect("non-empty command");
+            let spawned = std::process::Command::new(prog)
+                .args(args)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+            if let Ok(mut child) = spawned {
+                if let Some(mut stdin) = child.stdin.take() {
+                    let _ = stdin.write_all(text.as_bytes());
+                }
+                let _ = child.wait();
+                self.status = format!("copied {}", truncate(text, 44));
+                return;
+            }
+        }
+        self.status = "no clipboard tool found (pbcopy / wl-copy / xclip / xsel)".into();
+    }
+
     // ---- fuzzy finder -----------------------------------------
 
     fn open_search(&mut self) {
@@ -2325,17 +2516,25 @@ impl App {
     }
 
     fn handle_confirm(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                if let Mode::Confirm(c) = std::mem::replace(&mut self.mode, Mode::Normal) {
-                    self.perform_confirm(c.action);
-                }
+        // A quit prompt also takes a second `q` as "yes", so the muscle-memory
+        // `qq` still works while a stray single `q` doesn't.
+        let quit = matches!(
+            self.mode,
+            Mode::Confirm(ConfirmState {
+                action: ConfirmAction::Quit,
+                ..
+            })
+        );
+        let accept = matches!(key.code, KeyCode::Char('y' | 'Y') | KeyCode::Enter)
+            || (quit && matches!(key.code, KeyCode::Char('q' | 'Q')));
+
+        if accept {
+            if let Mode::Confirm(c) = std::mem::replace(&mut self.mode, Mode::Normal) {
+                self.perform_confirm(c.action);
             }
-            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                self.mode = Mode::Normal;
-                self.status = "cancelled".into();
-            }
-            _ => {}
+        } else if matches!(key.code, KeyCode::Char('n' | 'N') | KeyCode::Esc) {
+            self.mode = Mode::Normal;
+            self.status = "cancelled".into();
         }
     }
 
@@ -2686,6 +2885,7 @@ impl App {
                 self.dirty = true;
                 self.status = "milestone deleted".into();
             }
+            ConfirmAction::Quit => self.should_quit = true,
         }
     }
 

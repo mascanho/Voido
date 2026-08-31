@@ -13,8 +13,9 @@ use ratatui::{
 };
 
 use crate::app::{
-    App, AttachState, ConfirmState, DetailNote, EditTarget, Focus, InputState, LogEntry, Mode,
-    PaneRects, SearchState, SearchTarget, Tab, TagState, TagTarget, ThemeState, TlKind,
+    App, AttachState, ConfirmAction, ConfirmState, DetailNote, EditTarget, Focus, InputState,
+    LinksState, LogEntry, Mode, PaneRects, SearchState, SearchTarget, Tab, TagState, TagTarget,
+    ThemeState, TlKind, Toast, ToastKind,
 };
 use crate::model::{AttachmentKind, Priority};
 use crate::theme::{accent, bg, blue, border, green, on_accent, red, sel_bg, subtle, text, yellow};
@@ -116,9 +117,14 @@ pub fn render(f: &mut Frame, app: &App) {
         Mode::Notice(title, body) => render_notice(f, area, title, body),
         Mode::Attach(state) => render_attach(f, area, state, app),
         Mode::Tags(state) => render_tags(f, area, state, app),
+        Mode::Links(state) => render_links(f, area, state),
         Mode::Search(state) => render_search(f, area, state, app),
         Mode::EditBody(_) => {}
         Mode::Normal => {}
+    }
+
+    if let Some(t) = &app.toast {
+        render_toast(f, area, t);
     }
 }
 
@@ -1214,7 +1220,8 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
         | Mode::Weather
         | Mode::Theme(_)
         | Mode::Attach(_)
-        | Mode::Tags(_) => ("N", accent()),
+        | Mode::Tags(_)
+        | Mode::Links(_) => ("N", accent()),
     };
     let pane_label = match app.focus {
         Focus::Projects => "PROJECTS",
@@ -1242,30 +1249,20 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
         ),
     ];
     // GitHub sync state, right after the pane segment. Nerd Font glyphs:
-    // \u{f09b} github ·  \u{f021} sync-arrows ·  \u{f0ee} cloud-upload ·  \u{f00c} check.
+    // \u{f09b} github ·  \u{f021} sync-arrows ·  \u{f0ee} cloud-upload. Sync
+    // *results* land in a toast, not here — this is just the standing state.
     if app.sync_in_flight {
-        spans.push(Span::styled(
-            " \u{f021} ",
-            Style::new().fg(yellow()).bold(),
-        ));
+        spans.push(Span::styled(" \u{f021} ", Style::new().fg(yellow()).bold()));
     } else if app.sync_ready() {
-        spans.push(Span::styled(
-            " \u{f09b} ",
-            Style::new().fg(green()).bold(),
-        ));
+        spans.push(Span::styled(" \u{f09b} ", Style::new().fg(green()).bold()));
         if app.sync_pending > 0 {
             spans.push(Span::styled(
                 format!(" \u{f0ee} {} ", app.sync_pending),
                 Style::new().fg(yellow()),
             ));
-        } else if let Some(t) = app.last_sync {
-            spans.push(Span::styled(
-                format!(" \u{f00c} {} ", rel_time(t)),
-                Style::new().fg(subtle()),
-            ));
         }
     }
-    // Transient action feedback only — key hints live in the `?` overlay.
+    // Transient feedback that isn't a logged data change (hints, errors).
     if matches!(app.mode, Mode::Normal) && !app.status.is_empty() {
         spans.push(Span::styled(
             format!("  {}", app.status),
@@ -1407,6 +1404,43 @@ fn render_notice(f: &mut Frame, area: Rect, title: &str, body: &str) {
     );
 }
 
+/// A transient "sonner" — a small notification in the bottom-right that the app
+/// clears on its own after a few seconds (see `App::tick_toast`).
+fn render_toast(f: &mut Frame, area: Rect, toast: &Toast) {
+    let (accent_c, glyph) = match toast.kind {
+        ToastKind::Success => (green(), "\u{f058}"),
+        ToastKind::Error => (red(), "\u{f057}"),
+        ToastKind::Info => (accent(), "\u{f05a}"),
+    };
+    let text_w = toast.text.chars().count() as u16;
+    let w = (text_w + 7).min(area.width.saturating_sub(2)).max(12);
+    let h = 3;
+    if area.width < w + 2 || area.height < h + 3 {
+        return;
+    }
+    let rect = Rect {
+        x: area.x + area.width - w - 2,
+        y: area.y + area.height - h - 2, // clear of the footer row
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(accent_c))
+        .style(Style::new().bg(bg()))
+        .padding(Padding::horizontal(1));
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(format!("{glyph}  "), Style::new().fg(accent_c).bold()),
+            Span::styled(toast.text.clone(), Style::new().fg(text())),
+        ]))
+        .block(block),
+        rect,
+    );
+}
+
 fn render_weather(f: &mut Frame, area: Rect, app: &App) {
     let Some(w) = &app.weather else {
         return;
@@ -1505,11 +1539,18 @@ fn render_confirm(f: &mut Frame, area: Rect, c: &ConfirmState) {
     let rect = popup(area, width, 7);
     overlay(f, rect);
 
+    // A quit prompt isn't destructive — style it calmer than a delete.
+    let quit = matches!(c.action, ConfirmAction::Quit);
+    let (edge, title) = if quit {
+        (accent(), " Quit ")
+    } else {
+        (red(), " Confirm ")
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(red()))
-        .title(Span::styled(" Confirm ", Style::new().fg(red()).bold()))
+        .border_style(Style::new().fg(edge))
+        .title(Span::styled(title, Style::new().fg(edge).bold()))
         .padding(Padding::new(2, 2, 1, 1));
     let text = vec![
         Line::from(Span::styled(c.prompt.clone(), Style::new().fg(text()))),
@@ -1545,7 +1586,7 @@ fn render_help(f: &mut Frame, area: Rect) {
         ("m", "minimal view"),
         ("", ""),
         ("", "SYSTEM"),
-        ("?  q", "help · quit  (^c)"),
+        ("?  q", "help · quit (asks; ^c skips)"),
         ("^t  ^e", "theme · edit settings"),
         ("^s  ^g", "save to GitHub · link repo"),
         ("^l  ^w", "activity panel · weather"),
@@ -1588,6 +1629,7 @@ fn render_help(f: &mut Frame, area: Rect) {
         ("", "NOTE BODY / EDITOR"),
         ("j k ^d ^u", "scroll · page"),
         ("space", "expand / collapse"),
+        ("L", "links → open / copy"),
         ("e  ^s", "edit · save & close"),
     ];
 
@@ -1962,6 +2004,56 @@ fn render_tags(f: &mut Frame, area: Rect, state: &TagState, app: &App) {
         .highlight_symbol("▍");
     let mut ls = ListState::default();
     ls.select(Some(state.sel.min(tags.len().saturating_sub(1))));
+    f.render_stateful_widget(list, inner, &mut ls);
+}
+
+/// The `L` overlay: links pulled from the note on screen.
+fn render_links(f: &mut Frame, area: Rect, state: &LinksState) {
+    let width = area.width.saturating_sub(6).clamp(44, 92);
+    let height = (state.items.len() as u16 + 6).clamp(8, area.height.saturating_sub(2));
+    let rect = popup(area, width, height);
+    overlay(f, rect);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(accent()))
+        .title(Span::styled(" Links ", Style::new().fg(accent()).bold()))
+        .title(
+            Line::from(Span::styled(
+                " o open · y copy · esc close ",
+                Style::new().fg(subtle()),
+            ))
+            .right_aligned(),
+        )
+        .padding(Padding::symmetric(2, 1));
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    let url_w = inner.width.saturating_sub(2) as usize;
+    let items: Vec<ListItem> = state
+        .items
+        .iter()
+        .map(|(label, url)| {
+            let mut lines = vec![Line::from(Span::styled(
+                truncate(url, url_w.max(8)),
+                Style::new().fg(blue()).add_modifier(Modifier::UNDERLINED),
+            ))];
+            if label != url {
+                lines.push(Line::from(Span::styled(
+                    format!("  {}", truncate(label, url_w.saturating_sub(2).max(6))),
+                    Style::new().fg(subtle()),
+                )));
+            }
+            ListItem::new(lines)
+        })
+        .collect();
+
+    let list = List::new(items)
+        .highlight_style(Style::new().bg(sel_bg()).bold())
+        .highlight_symbol("▍");
+    let mut ls = ListState::default();
+    ls.select(Some(state.sel.min(state.items.len().saturating_sub(1))));
     f.render_stateful_widget(list, inner, &mut ls);
 }
 

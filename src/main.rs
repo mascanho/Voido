@@ -297,12 +297,12 @@ fn run(
                 Ok(()) => match Config::load() {
                     Ok(Some(cfg)) => {
                         app.reload_config(cfg);
-                        app.status = "settings reloaded".into();
+                        app.toast(app::ToastKind::Info, "Settings reloaded");
                     }
                     Ok(None) => {}
-                    Err(e) => app.status = format!("settings: {e}"),
+                    Err(e) => app.toast(app::ToastKind::Error, format!("Settings: {e}")),
                 },
-                Err(e) => app.status = e,
+                Err(e) => app.toast(app::ToastKind::Error, e),
             }
             redraw = true;
         }
@@ -326,6 +326,11 @@ fn run(
 
         // Fold this pass's status message into the ^l activity panel.
         app.record_activity(saved);
+
+        // Expire the transient toast, if any.
+        if app.tick_toast() {
+            redraw = true;
+        }
 
         if redraw {
             app.clamp();

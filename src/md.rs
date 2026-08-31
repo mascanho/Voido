@@ -29,6 +29,61 @@ fn code_style() -> Style {
     Style::new().fg(yellow()).bg(sel_bg())
 }
 
+/// Every link (and image) URL in `src`, paired with its visible text — falling
+/// back to the URL itself when there's no text. Bare `http(s)://…` runs sitting
+/// in plain prose are picked up too. De-duplicated by URL, in document order.
+pub fn extract_links(src: &str) -> Vec<(String, String)> {
+    let mut opts = Options::empty();
+    opts.insert(Options::ENABLE_STRIKETHROUGH);
+    opts.insert(Options::ENABLE_TASKLISTS);
+
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut push = |url: String, label: String| {
+        let url = url.trim().to_string();
+        if !url.is_empty() && seen.insert(url.clone()) {
+            let label = label.trim();
+            let label = if label.is_empty() { url.clone() } else { label.to_string() };
+            out.push((label, url));
+        }
+    };
+
+    // (url, accumulated link text) while inside a `[text](url)` span.
+    let mut cur: Option<(String, String)> = None;
+
+    for event in Parser::new_ext(src, opts) {
+        match event {
+            Event::Start(Tag::Link { dest_url, .. }) => {
+                cur = Some((dest_url.to_string(), String::new()));
+            }
+            Event::End(TagEnd::Link) => {
+                if let Some((url, text)) = cur.take() {
+                    push(url, text);
+                }
+            }
+            Event::Start(Tag::Image {
+                dest_url, title, ..
+            }) => push(dest_url.to_string(), title.to_string()),
+            Event::Text(t) | Event::Code(t) => match &mut cur {
+                Some((_, text)) => text.push_str(t.as_ref()),
+                None => {
+                    for word in t.split(|c: char| {
+                        c.is_whitespace()
+                            || ['<', '>', '(', ')', '[', ']', '"', '\'', '`'].contains(&c)
+                    }) {
+                        let word = word.trim_end_matches(['.', ',', ';', ':', '!', '?']);
+                        if word.starts_with("http://") || word.starts_with("https://") {
+                            push(word.to_string(), word.to_string());
+                        }
+                    }
+                }
+            },
+            _ => {}
+        }
+    }
+    out
+}
+
 struct Renderer {
     width: usize,
     lines: Vec<Line<'static>>,
@@ -349,6 +404,28 @@ mod tests {
         assert!(joined.contains("2. second"));
         // blank line between blocks, never doubled
         assert!(!joined.contains("\n\n\n"));
+    }
+
+    #[test]
+    fn extracts_links_and_bare_urls() {
+        let links = extract_links(
+            "See [the docs](https://example.com/docs) and https://bare.example.org.\n\n\
+             Also [dup](https://example.com/docs) again, and <https://auto.example>.",
+        );
+        assert_eq!(
+            links,
+            vec![
+                ("the docs".to_string(), "https://example.com/docs".to_string()),
+                (
+                    "https://bare.example.org".to_string(),
+                    "https://bare.example.org".to_string()
+                ),
+                (
+                    "https://auto.example".to_string(),
+                    "https://auto.example".to_string()
+                ),
+            ]
+        );
     }
 
     #[test]

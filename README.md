@@ -138,8 +138,13 @@ pane keeps its own `i` toggle, so expanding todos doesn't also expand the rail.
  │▍◈ Website  3/8 ││ ○ Design system in Figma        ↑  ⊞2/3    Sep 01││ ✔ Hero       │
  │ ◆ Voido      ✓ ││ ○ Rebuild the home page              ¶     Sep 09││ ○ Nav+footer │
  ╰────────────────╯╰──────────────────────────────────────────────╯╰──────────────╯
-  N  TODOS   <status>                                  Website > todos
+  N  TODOS         ☀ 16°C · Wed Aug 30 · 14:20         Website > todos
 ```
+
+The footer carries the mode (`N`/`I`) and focused pane on the left, the weather +
+clock centred, and a breadcrumb on the right. One-off events (a finished sync, a
+settings reload) surface as a self-dismissing toast in the bottom-right rather
+than sticking in the footer; the full history is in the `^l` panel.
 
 The middle pane's tabs live on its top border. Left rail is the project list;
 the right pane shows subtasks (Todos) or the note body (Notes).
@@ -168,6 +173,10 @@ not persisted. `^l` again hides it.
   **Markdown body** in the right pane, rendered properly (headings, nested
   lists, block quotes, fenced code, rules, `**bold**` / `*italic*` / `` `code` ``).
   `e` opens a full Markdown editor (`esc` or `^s` to save)
+- Whenever a note (project, todo or subtask) is on screen, **`L`** lists every
+  link in it — `o` / `enter` opens one in your browser, `y` copies the URL to the
+  clipboard (`pbcopy` / `wl-copy` / `xclip` / `xsel`). Bare `https://…` URLs in
+  the text count, not just `[markdown](links)`.
 - **Timeline** — every milestone (◆) plus every due-dated todo, sorted by date,
   with `overdue` / `in 3d` markers
 
@@ -179,7 +188,7 @@ time for the full list.
 
 | Scope | Keys |
 | --- | --- |
-| Global | `h`/`l` switch pane · `w`/`s` prev/next project · `tab`/`S-tab` switch view · `1`‑`4` jump to a view · `gg`/`G` top/bottom · `esc` back out · `/` fuzzy find · `m` minimal view · `^l` activity panel · `^w` weather · `^t` theme · `^s` save to GitHub · `^e` edit settings file · `?` help · `q` quit |
+| Global | `h`/`l` switch pane · `w`/`s` prev/next project · `tab`/`S-tab` switch view · `1`‑`4` jump to a view · `gg`/`G` top/bottom · `esc` back out · `/` fuzzy find · `m` minimal view · `^l` activity panel · `^w` weather · `^t` theme · `^s` save to GitHub · `^e` edit settings file · `?` help · `q` quit (asks to confirm — `qq`, `y` or `enter`; `^c` quits straight away) |
 | Projects | `a` add · `r` rename · `d` delete · `l` open · `i` detail · `t` tags · `^g` link/unlink code repo · `o` repo activity |
 | Overview | `e` edit description · `r` rename · `t` tags |
 | Todos | `a` add · `e` edit · `d` delete · `x` (or space) done · `p` priority · `o` sort by priority (cycles High/Med/Low on top) · `J`/`K` reorder · `l` subtasks · `i` detail · `n` view note · `N` edit note · `t` tags · `A` attachments |

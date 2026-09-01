@@ -14,7 +14,7 @@ use ratatui::text::Line;
 use tui_textarea::{CursorMove, TextArea};
 
 use crate::config::{Config, StorageChoice};
-use crate::github::{GitHubClient, RepoInfo, SyncClient};
+use crate::github::{GitHubClient, RepoInfo, RepoRef, SyncClient};
 use crate::model::{Attachment, Milestone, Note, Priority, Project, Store, Subtask, Todo};
 use crate::util::truncate;
 
@@ -167,6 +167,8 @@ pub enum InputAction {
     /// GitHub data-sync setup: repo, then token.
     SyncRepo,
     SyncToken,
+    /// Fetch a settings file out of a GitHub repo and adopt it.
+    ImportSettings,
 }
 
 pub struct InputState {
@@ -192,6 +194,8 @@ pub enum ConfirmAction {
     Quit,
     /// Replace the entire store with a dataset loaded from a file.
     ImportData(Box<Store>),
+    /// Replace the settings with the ones fetched from a GitHub repo.
+    ImportSettings(Box<Config>),
 }
 
 pub struct ConfirmState {
@@ -208,6 +212,17 @@ pub enum EditTarget {
     TodoNote(usize),
     /// The note attached to the current todo's subtask at this index.
     SubtaskNote(usize),
+}
+
+/// The note `^f` blows up to fill the window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FullNote {
+    /// The selected todo's own note.
+    Todo,
+    /// The note of the current todo's subtask at this index.
+    Subtask(usize),
+    /// The Markdown body of the selected note in the Notes tab.
+    Note,
 }
 
 /// Which note the Todos-tab detail pane is rendering.
@@ -365,6 +380,7 @@ pub enum MenuAction {
     Export,
     Import,
     Settings,
+    ImportSettings,
     Theme,
     Weather,
     Activity,
@@ -380,6 +396,12 @@ impl MenuAction {
         (MenuAction::Export, "\u{f0ee}", "Export data…", ""),
         (MenuAction::Import, "\u{f019}", "Import data…", ""),
         (MenuAction::Settings, "\u{f013}", "Settings", "^e"),
+        (
+            MenuAction::ImportSettings,
+            "\u{f0ed}",
+            "Settings from GitHub…",
+            "",
+        ),
         (MenuAction::Theme, "\u{f043}", "Theme", "^t"),
         (MenuAction::Weather, "\u{f0c2}", "Weather", "^w"),
         (MenuAction::Activity, "\u{f085}", "Activity log", "^l"),
@@ -402,6 +424,8 @@ pub struct App {
     pub note_idx: usize,
     pub note_scroll: u16,
     pub note_expanded: bool,
+    /// `^f`: the note on screen fills the whole window, panes and all.
+    pub note_full: bool,
     /// `n` toggles the selected todo's note into the detail pane; `n` inside the
     /// Subtasks pane toggles the selected subtask's note into a section below the
     /// list. Independent, each with its own `^d` / `^u` scroll offset.
@@ -465,6 +489,13 @@ pub struct App {
     /// Repo name captured from the first `^s` prompt, pending a token step.
     pending_sync_repo: Option<String>,
     sync_rx: Option<Receiver<Result<SyncOk, String>>>,
+    /// Receiver for an in-flight settings import (menu → "Settings from GitHub").
+    settings_rx: Option<Receiver<Result<ImportedSettings, String>>>,
+    settings_in_flight: bool,
+    /// Receiver for an in-flight data import from a repo — "Import data" given a
+    /// GitHub link instead of a file path.
+    data_rx: Option<Receiver<Result<ImportedData, String>>>,
+    data_in_flight: bool,
     /// Current-conditions snapshot for the header / Overview, when `weather` is
     /// configured. `None` until the first fetch lands.
     pub weather: Option<crate::weather::Weather>,
@@ -484,6 +515,20 @@ pub struct App {
 pub struct SyncOk {
     repo: String,
     sha: String,
+}
+
+/// A settings file fetched from a repo, waiting for the user to confirm it.
+pub struct ImportedSettings {
+    config: Config,
+    /// `owner/repo/path@ref` — echoed in the confirmation and the log.
+    source: String,
+}
+
+/// A dataset fetched from a repo, waiting for the user to confirm it.
+pub struct ImportedData {
+    store: Store,
+    /// `owner/repo/path@ref` — echoed in the confirmation and the log.
+    source: String,
 }
 
 impl App {
@@ -513,6 +558,7 @@ impl App {
             todo_note_scroll: 0,
             sub_note_scroll: 0,
             note_expanded: false,
+            note_full: false,
             project_info: false,
             todo_info: false,
             subtask_info: false,
@@ -543,6 +589,10 @@ impl App {
             last_sync: None,
             pending_sync_repo: None,
             sync_rx: None,
+            settings_rx: None,
+            settings_in_flight: false,
+            data_rx: None,
+            data_in_flight: false,
             weather: None,
             weather_rx: None,
             weather_in_flight: false,
@@ -563,12 +613,55 @@ impl App {
     pub fn reload_config(&mut self, config: Config) {
         let repo_changed = config.github_repo != self.config.github_repo
             || config.github_file != self.config.github_file;
+        let weather_changed = config.weather != self.config.weather
+            || config.weather_unit != self.config.weather_unit;
         self.config = config;
         self.sync_token = crate::github::resolve_token(self.config.github_token.as_deref());
         self.gh_client = GitHubClient::new(self.sync_token.clone());
         if repo_changed {
             self.sync_sha = None;
         }
+        // Rebuild the theme list so themes added to the file show up in `^t`
+        // right away, then re-apply the selected slug over the new registry.
+        for warning in crate::theme::install_custom(&self.config.themes) {
+            self.push_log(warning);
+        }
+        match self.config.theme.as_deref() {
+            Some(slug) => crate::theme::set_slug(Some(slug)),
+            // The key was removed (or the imported file never had one) — that
+            // means "the default", not "keep whatever is on screen".
+            None => crate::theme::set_index(0),
+        }
+        self.clear_render_cache();
+        if weather_changed {
+            self.weather = None;
+            self.weather_last_try = None; // refetch against the new location
+        }
+    }
+
+    /// Adopt an imported settings file: keep the local token, write the result
+    /// to `config.toml`, and apply it to the running app.
+    fn adopt_settings(&mut self, incoming: Config) {
+        let mut config = self.config.clone();
+        config.apply_import(incoming);
+        if let Err(e) = config.save() {
+            self.push_log(format!("settings import failed: {e}"));
+            self.toast(ToastKind::Error, format!("Could not save settings: {e}"));
+            return;
+        }
+        let repo_before = self.config.github_repo.clone();
+        self.reload_config(config);
+        self.push_log("imported settings from GitHub");
+        self.toast(ToastKind::Success, "Settings imported");
+        // A new sync repo only takes effect for *data* on the next start, which
+        // is when voido pulls it — say so rather than let the exit push surprise
+        // anyone.
+        self.status = match &self.config.github_repo {
+            Some(repo) if Some(repo) != repo_before.as_ref() && self.config.sync_configured() => {
+                format!("settings imported — restart to pull data from {repo}")
+            }
+            _ => "settings imported".into(),
+        };
     }
 
     /// Record that the local store diverged from what's on GitHub. Called once
@@ -720,6 +813,58 @@ impl App {
             }
         }
 
+        if let Some(rx) = &self.settings_rx {
+            match rx.try_recv() {
+                Ok(result) => {
+                    self.settings_rx = None;
+                    self.settings_in_flight = false;
+                    self.status.clear(); // wipe the lingering "fetching…" line
+                    match result {
+                        Ok(imported) => self.offer_settings_import(imported),
+                        Err(e) => {
+                            self.push_log(format!("settings import failed: {e}"));
+                            self.mode = Mode::Notice("Settings import failed".into(), e);
+                        }
+                    }
+                    changed = true;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.settings_rx = None;
+                    self.settings_in_flight = false;
+                    self.push_log("settings import failed");
+                    self.toast(ToastKind::Error, "Settings import failed");
+                    changed = true;
+                }
+            }
+        }
+
+        if let Some(rx) = &self.data_rx {
+            match rx.try_recv() {
+                Ok(result) => {
+                    self.data_rx = None;
+                    self.data_in_flight = false;
+                    self.status.clear(); // wipe the lingering "fetching…" line
+                    match result {
+                        Ok(imported) => self.offer_data_import(imported),
+                        Err(e) => {
+                            self.push_log(format!("data import failed: {e}"));
+                            self.mode = Mode::Notice("Data import failed".into(), e);
+                        }
+                    }
+                    changed = true;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.data_rx = None;
+                    self.data_in_flight = false;
+                    self.push_log("data import failed");
+                    self.toast(ToastKind::Error, "Data import failed");
+                    changed = true;
+                }
+            }
+        }
+
         if let Some(rx) = &self.weather_rx {
             match rx.try_recv() {
                 Ok(result) => {
@@ -801,6 +946,63 @@ impl App {
             "GitHub sync — repo  (owner/repo)"
         };
         self.begin_input(title, pre, InputAction::SyncRepo);
+    }
+
+    /// Menu → "Settings from GitHub": ask which repo (and, optionally, which
+    /// file) holds the settings to adopt.
+    fn import_settings_prompt(&mut self) {
+        if self.settings_in_flight {
+            self.status = "already fetching settings…".into();
+            return;
+        }
+        let pre = self.config.github_repo.clone().unwrap_or_default();
+        self.begin_input(
+            "Import settings — owner/repo[/path], or a GitHub URL",
+            pre,
+            InputAction::ImportSettings,
+        );
+    }
+
+    /// Fetch the settings file on a worker thread. Nothing is changed until the
+    /// result lands and the user confirms the diff.
+    fn spawn_settings_fetch(&mut self, spec: &str) {
+        if self.settings_in_flight {
+            return;
+        }
+        let Some(target) = crate::github::parse_repo_ref(spec) else {
+            self.status = "invalid repo — use owner/repo, or a GitHub URL".into();
+            return;
+        };
+        let label = target.label();
+        let token = self.sync_token.clone();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(fetch_settings(token.as_deref(), target));
+        });
+        self.settings_rx = Some(rx);
+        self.settings_in_flight = true;
+        self.status = format!("fetching settings from {label}…");
+    }
+
+    /// Show what the fetched file would change and ask before touching anything.
+    fn offer_settings_import(&mut self, imported: ImportedSettings) {
+        let diff = self.config.import_diff(&imported.config);
+        if diff.is_empty() {
+            self.push_log(format!(
+                "settings from {} match the current ones",
+                imported.source
+            ));
+            self.toast(ToastKind::Info, "Settings already match");
+            return;
+        }
+        self.mode = Mode::Confirm(ConfirmState {
+            prompt: format!(
+                "Adopt these settings from {}?\n\n{}",
+                imported.source,
+                diff.join("\n")
+            ),
+            action: ConfirmAction::ImportSettings(Box::new(imported.config)),
+        });
     }
 
     /// Kick off setup with the repo + token now in hand: save config, then push
@@ -907,6 +1109,114 @@ impl App {
                 .current_todo()
                 .and_then(|t| t.subtasks.get(self.subtask_idx))
                 .is_some_and(|s| !s.note.trim().is_empty())
+    }
+
+    /// Does the middle pane read as the live one? While a todo's note fills the
+    /// detail pane it's the note that's lit, so the list steps back — it still
+    /// takes the keys, but only one pane wears the accent at a time.
+    pub fn content_lit(&self) -> bool {
+        self.focus == Focus::Content && !self.showing_todo_note()
+    }
+
+    /// The note on screen that `^f` can expand, if there is one.
+    pub fn active_note(&self) -> Option<FullNote> {
+        if self.tab == Tab::Notes {
+            return self
+                .current_note()
+                .filter(|n| !n.body.trim().is_empty())
+                .map(|_| FullNote::Note);
+        }
+        if self.showing_sub_note() {
+            return Some(FullNote::Subtask(self.subtask_idx));
+        }
+        if self.showing_todo_note() {
+            return Some(FullNote::Todo);
+        }
+        None
+    }
+
+    /// Title, body and scroll offset of the note filling the screen — what the
+    /// renderer needs, resolved in one place.
+    pub fn full_note_view(&self) -> Option<(String, &str, u16)> {
+        match self.active_note()? {
+            FullNote::Note => {
+                let note = self.current_note()?;
+                Some((
+                    format!(" Note · {} ", note.text),
+                    note.body.as_str(),
+                    self.note_scroll,
+                ))
+            }
+            FullNote::Todo => {
+                let todo = self.current_todo()?;
+                Some((
+                    format!(" Note · {} ", todo.title),
+                    todo.note.as_str(),
+                    self.todo_note_scroll,
+                ))
+            }
+            FullNote::Subtask(i) => {
+                let sub = self.current_todo()?.subtasks.get(i)?;
+                Some((
+                    format!(" ↳ Note · {} ", sub.title),
+                    sub.note.as_str(),
+                    self.sub_note_scroll,
+                ))
+            }
+        }
+    }
+
+    /// `^f`: blow the note on screen up to fill the window, or drop back to the
+    /// panes if it already does.
+    fn toggle_note_full(&mut self) {
+        if self.note_full {
+            self.note_full = false;
+            self.status = "note collapsed".into();
+            return;
+        }
+        match self.active_note() {
+            Some(_) => {
+                self.note_full = true;
+                self.status = "full-screen note — ^f or esc to close".into();
+            }
+            None => {
+                self.status =
+                    "no note on screen — press n on a todo or subtask, or l on a note".into();
+            }
+        }
+    }
+
+    /// Scroll whichever note `^f` is showing (or would show).
+    fn scroll_active_note(&mut self, delta: i32) {
+        let target = match self.active_note() {
+            Some(FullNote::Note) => &mut self.note_scroll,
+            Some(FullNote::Todo) => &mut self.todo_note_scroll,
+            Some(FullNote::Subtask(_)) => &mut self.sub_note_scroll,
+            None => return,
+        };
+        *target = if delta < 0 {
+            target.saturating_sub((-delta) as u16)
+        } else {
+            target.saturating_add(delta as u16)
+        };
+    }
+
+    /// Keys while a note fills the window: scroll it, or step back out. The
+    /// global keys (`?`, `/`, `L`, `q`, the `^` bindings) are handled before this.
+    fn handle_full_note_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => self.scroll_active_note(1),
+            KeyCode::Char('k') | KeyCode::Up => self.scroll_active_note(-1),
+            KeyCode::PageDown => self.scroll_active_note(10),
+            KeyCode::PageUp => self.scroll_active_note(-10),
+            KeyCode::Char('g') | KeyCode::Home => self.scroll_active_note(-30_000),
+            KeyCode::Char('G') | KeyCode::End => self.scroll_active_note(30_000),
+            KeyCode::Esc | KeyCode::Char('h') | KeyCode::Left => {
+                self.note_full = false;
+                self.status = "note collapsed".into();
+            }
+            _ => {}
+        }
     }
 
     /// `n` on a todo: flip its note in/out of the detail pane.
@@ -1114,6 +1424,10 @@ impl App {
         if self.sub_note_focus && !self.showing_sub_note() {
             self.sub_note_focus = false;
         }
+        // Nothing left to blow up (note deleted, selection moved off it).
+        if self.note_full && self.active_note().is_none() {
+            self.note_full = false;
+        }
     }
 
     // ---- top level dispatch --------------------------------------------
@@ -1162,6 +1476,10 @@ impl App {
     /// Route a wheel tick: scroll a note pane when the pointer is over one that's
     /// showing (or the sub-note pane has focus), otherwise move the selection.
     fn wheel_scroll(&mut self, pos: Position, delta: i32) {
+        if self.note_full {
+            self.scroll_active_note(delta);
+            return;
+        }
         let over_detail = {
             let r = self.pane_rects.borrow();
             r.detail.area() > 0 && r.detail.contains(pos)
@@ -1264,6 +1582,7 @@ impl App {
                 KeyCode::Char('t') => self.open_theme(),
                 KeyCode::Char('k') => self.mode = Mode::Menu(MenuState { sel: 0 }),
                 KeyCode::Char('w') => self.open_weather(),
+                KeyCode::Char('f') => self.toggle_note_full(),
                 KeyCode::Char('l') => {
                     self.activity_open = !self.activity_open;
                     self.status = if self.activity_open {
@@ -1273,6 +1592,8 @@ impl App {
                     };
                 }
                 // page scroll in the note body
+                KeyCode::Char('d') if self.note_full => self.scroll_active_note(10),
+                KeyCode::Char('u') if self.note_full => self.scroll_active_note(-10),
                 KeyCode::Char('d') if self.focus == Focus::Detail && self.tab == Tab::Notes => {
                     self.note_scroll = self.note_scroll.saturating_add(10);
                 }
@@ -1296,6 +1617,20 @@ impl App {
         }
 
         let g_pending = std::mem::replace(&mut self.pending_g, false);
+
+        // A full-screen note swallows the navigation keys — there are no panes
+        // to move between — but leaves the global ones below it alone.
+        if self.note_full
+            && !matches!(
+                key.code,
+                KeyCode::Char('q' | '?' | '/' | 'L' | 'm' | '1' | '2' | '3' | '4')
+                    | KeyCode::Tab
+                    | KeyCode::BackTab
+            )
+        {
+            self.handle_full_note_key(key);
+            return;
+        }
 
         match key.code {
             KeyCode::Char('q') => {
@@ -2280,11 +2615,12 @@ impl App {
                 self.begin_input("Export data — file path", path, InputAction::ExportData);
             }
             MenuAction::Import => self.begin_input(
-                "Import data — file path (replaces everything)",
-                String::new(),
+                "Import data — file path, or a GitHub link (replaces everything)",
+                self.import_prefill(),
                 InputAction::ImportData,
             ),
             MenuAction::Settings => self.open_settings = true,
+            MenuAction::ImportSettings => self.import_settings_prompt(),
             MenuAction::Theme => self.open_theme(),
             MenuAction::Weather => self.open_weather(),
             MenuAction::Activity => {
@@ -2337,17 +2673,72 @@ impl App {
         };
         match serde_json::from_str::<Store>(&raw) {
             Ok(store) => {
-                let n = store.projects.len();
                 self.mode = Mode::Confirm(ConfirmState {
                     prompt: format!(
-                        "Replace ALL data with {n} project{} from this file?",
-                        if n == 1 { "" } else { "s" }
+                        "Replace ALL data with\n{}\nfrom this file?",
+                        store_summary(&store)
                     ),
                     action: ConfirmAction::ImportData(Box::new(store)),
                 });
             }
             Err(e) => self.toast(ToastKind::Error, format!("not valid voido data: {e}")),
         }
+    }
+
+    /// What the "Import data" prompt starts with: the sync repo, when one is set
+    /// up, since that's the dataset people most often want to pull in.
+    fn import_prefill(&self) -> String {
+        if !self.config.sync_configured() {
+            return String::new();
+        }
+        self.config.github_repo.clone().unwrap_or_default()
+    }
+
+    /// Paths tried when a repo is given with no file: whatever this install
+    /// syncs under first, then the usual spots.
+    fn data_candidates(&self) -> Vec<String> {
+        let mut out = vec![self.config.sync_file()];
+        for path in crate::config::DATA_CANDIDATES {
+            if !out.iter().any(|c| c == path) {
+                out.push((*path).to_string());
+            }
+        }
+        out
+    }
+
+    /// Pull a dataset out of a repo on a worker thread. As with a file import,
+    /// nothing is replaced until the result lands and the user confirms.
+    fn spawn_data_fetch(&mut self, spec: &str) {
+        if self.data_in_flight {
+            self.status = "already fetching data…".into();
+            return;
+        }
+        let Some(target) = crate::github::parse_repo_ref(spec) else {
+            self.status = "invalid link — use owner/repo, or a GitHub URL".into();
+            return;
+        };
+        let label = target.label();
+        let token = self.sync_token.clone();
+        let candidates = self.data_candidates();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(fetch_data(token.as_deref(), target, candidates));
+        });
+        self.data_rx = Some(rx);
+        self.data_in_flight = true;
+        self.status = format!("fetching data from {label}…");
+    }
+
+    /// Ask before replacing the store with what came back.
+    fn offer_data_import(&mut self, imported: ImportedData) {
+        self.mode = Mode::Confirm(ConfirmState {
+            prompt: format!(
+                "Replace ALL local data with\n{}\nfrom {}?",
+                store_summary(&imported.store),
+                imported.source
+            ),
+            action: ConfirmAction::ImportData(Box::new(imported.store)),
+        });
     }
 
     // ---- fuzzy finder -----------------------------------------
@@ -2964,10 +3355,13 @@ impl App {
                 }
             }
             InputAction::ImportData => {
-                if value.trim().is_empty() {
+                let v = value.trim();
+                if v.is_empty() {
                     self.status = "import cancelled".into();
+                } else if looks_like_github(v) {
+                    self.spawn_data_fetch(v);
                 } else {
-                    self.do_import(value.trim());
+                    self.do_import(v);
                 }
             }
             InputAction::LinkRepo => {
@@ -3009,6 +3403,14 @@ impl App {
                         self.config.github_token.clone().unwrap_or_default(),
                         InputAction::SyncToken,
                     );
+                }
+            }
+            InputAction::ImportSettings => {
+                let v = value.trim();
+                if v.is_empty() {
+                    self.status = "settings import cancelled".into();
+                } else {
+                    self.spawn_settings_fetch(v);
                 }
             }
             InputAction::SyncToken => {
@@ -3088,6 +3490,7 @@ impl App {
                 self.status = "milestone deleted".into();
             }
             ConfirmAction::Quit => self.should_quit = true,
+            ConfirmAction::ImportSettings(config) => self.adopt_settings(*config),
             ConfirmAction::ImportData(store) => {
                 let mut store = *store;
                 let n = store.projects.len();
@@ -3539,6 +3942,130 @@ fn milestone_edit_string(m: &Milestone) -> String {
     format!("{} @{}", m.title, m.date.format("%Y-%m-%d"))
 }
 
+/// Worker-thread body for a data import: read the dataset out of the repo and
+/// parse it. Nothing is replaced here; the caller confirms first.
+fn fetch_data(
+    token: Option<&str>,
+    target: RepoRef,
+    candidates: Vec<String>,
+) -> Result<ImportedData, String> {
+    let (store, source) = fetch_repo_file(token, target, candidates, "data", |text| {
+        serde_json::from_str::<Store>(text).map_err(|e| format!("not valid voido data: {e}"))
+    })?;
+    Ok(ImportedData { store, source })
+}
+
+/// Does an import target name a GitHub repo rather than a local file? URLs and
+/// `owner/repo` forms are remote; anything that exists on disk, or that reads as
+/// a path, stays local — so a relative `notes/data.json` still means the file.
+fn looks_like_github(spec: &str) -> bool {
+    let s = spec.trim();
+    const URLS: &[&str] = &[
+        "https://",
+        "http://",
+        "github.com/",
+        "raw.githubusercontent.com/",
+        "git@github.com:",
+    ];
+    if URLS.iter().any(|p| s.starts_with(p)) {
+        return true;
+    }
+    // Absolute, home-relative, dot-relative or a Windows drive: a path.
+    if s.starts_with(['/', '~', '.', '\\']) || s.contains(':') {
+        return false;
+    }
+    // A file that's actually there always wins over a repo of the same shape.
+    if expand_tilde(s).exists() {
+        return false;
+    }
+    crate::github::parse_repo_ref(s).is_some()
+}
+
+/// "4 projects · 27 todos · 9 notes" — what an import is about to bring in.
+fn store_summary(store: &Store) -> String {
+    let projects = store.projects.len();
+    let todos: usize = store.projects.iter().map(|p| p.todos.len()).sum();
+    let notes: usize = store.projects.iter().map(|p| p.notes.len()).sum();
+    let plural = |n: usize, word: &str| format!("{n} {word}{}", if n == 1 { "" } else { "s" });
+    format!(
+        "{} · {} · {}",
+        plural(projects, "project"),
+        plural(todos, "todo"),
+        plural(notes, "note")
+    )
+}
+
+/// Worker-thread body for a settings import: read the named file out of the
+/// repo — or, when no path was given, the first of the usual locations that
+/// exists — and parse it. Nothing is written here; the caller confirms first.
+fn fetch_settings(token: Option<&str>, target: RepoRef) -> Result<ImportedSettings, String> {
+    let candidates = crate::config::SETTINGS_CANDIDATES
+        .iter()
+        .map(|p| (*p).to_string())
+        .collect();
+    let (config, source) = fetch_repo_file(token, target, candidates, "settings", Config::parse)?;
+    Ok(ImportedSettings { config, source })
+}
+
+/// Read the file `target` names out of the repo, or — when it names no file —
+/// the first of `fallbacks` that exists, and parse it with `parse`. Returns the
+/// parsed value and the `owner/repo/path@ref` it actually came from.
+fn fetch_repo_file<T>(
+    token: Option<&str>,
+    target: RepoRef,
+    fallbacks: Vec<String>,
+    what: &str,
+    parse: impl Fn(&str) -> Result<T, String>,
+) -> Result<(T, String), String> {
+    let candidates = match &target.path {
+        Some(path) => vec![path.clone()],
+        None => fallbacks,
+    };
+
+    for path in &candidates {
+        let fetched = crate::github::fetch_file(
+            token,
+            &target.owner,
+            &target.repo,
+            path,
+            target.git_ref.as_deref(),
+        )?;
+        let Some(text) = fetched else { continue };
+        let value = parse(&text).map_err(|e| format!("{path}: {e}"))?;
+        let source = RepoRef {
+            path: Some(path.clone()),
+            ..target
+        }
+        .label();
+        return Ok((value, source));
+    }
+
+    // Every candidate 404'd. That is also how a missing repo and a private one
+    // look from here, so spend one more request telling those apart.
+    if !crate::github::repo_visible(token, &target.owner, &target.repo).unwrap_or(true) {
+        return Err(format!(
+            "{}/{} not found — check the name, and note that a private repo needs a token \
+             (config, `gh auth login`, or $GITHUB_TOKEN)",
+            target.owner, target.repo
+        ));
+    }
+    let repo = match &target.git_ref {
+        Some(r) => format!("{}/{}@{r}", target.owner, target.repo),
+        None => format!("{}/{}", target.owner, target.repo),
+    };
+    Err(match &target.path {
+        Some(path) => format!(
+            "{repo} has no {path} — check the path and the branch, and that the repo is visible \
+             to your token"
+        ),
+        None => format!(
+            "no {what} file in {repo} — tried {}. Give the path directly if it lives somewhere \
+             else, and check the repo is visible to your token.",
+            candidates.join(", ")
+        ),
+    })
+}
+
 /// Worker-thread body for a sync push. Resolves a bare repo name against the
 /// token's account, optionally creates the repo, then writes the data file
 /// (retrying once with a fresh SHA on a conflict).
@@ -3742,5 +4269,176 @@ mod tests {
         let (name, tags) = parse_tagged_name("Website Redesign #web #Frontend");
         assert_eq!(name, "Website Redesign");
         assert_eq!(tags, vec!["web", "frontend"]);
+    }
+}
+
+#[cfg(test)]
+mod import_data_tests {
+    use super::*;
+
+    fn app() -> App {
+        App::new(Store::default(), Config::default(), None, None)
+    }
+
+    #[test]
+    fn links_are_remote_and_paths_are_local() {
+        for remote in [
+            "me/notes",
+            "me/notes/voido-data.json",
+            "me/notes@backup",
+            "https://github.com/me/notes/blob/main/voido-data.json",
+            "github.com/me/notes",
+            "https://raw.githubusercontent.com/me/notes/main/data.json",
+        ] {
+            assert!(looks_like_github(remote), "{remote} should be a link");
+        }
+        for local in [
+            "/tmp/voido-export.json",
+            "~/voido-export.json",
+            "./data.json",
+            "../backups/data.json",
+            "voido-export.json",
+            "C:\\Users\\me\\data.json",
+        ] {
+            assert!(!looks_like_github(local), "{local} should be a path");
+        }
+    }
+
+    #[test]
+    fn an_existing_file_wins_over_a_repo_of_the_same_shape() {
+        let dir = std::env::temp_dir().join("voido-import-test/repo-shaped");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("data.json");
+        std::fs::write(&file, "{}").unwrap();
+        let spec = file.to_string_lossy().replace(':', ""); // drop any drive colon
+        if !spec.starts_with('/') {
+            return; // Windows-style temp dir — the path rules already cover it
+        }
+        assert!(!looks_like_github(&spec));
+    }
+
+    #[test]
+    fn a_bad_link_never_starts_a_fetch() {
+        let mut a = app();
+        a.spawn_data_fetch("not a repo");
+        assert!(a.status.contains("invalid link"), "{}", a.status);
+        assert!(!a.data_in_flight);
+        assert!(a.data_rx.is_none());
+    }
+
+    #[test]
+    fn the_configured_sync_file_is_tried_first() {
+        let mut a = app();
+        a.config.github_file = Some("archive/2026.json".into());
+        let c = a.data_candidates();
+        assert_eq!(c[0], "archive/2026.json");
+        assert!(c.contains(&crate::config::DEFAULT_SYNC_FILE.to_string()));
+        assert_eq!(
+            c.iter().collect::<std::collections::HashSet<_>>().len(),
+            c.len(),
+            "no duplicates: {c:?}"
+        );
+    }
+
+    #[test]
+    fn a_fetched_dataset_asks_before_replacing_anything() {
+        let mut a = app();
+        let before = a.store.projects.len();
+        let mut store = Store::default();
+        let mut p = Project::new("Imported");
+        p.todos.push(Todo::new("one"));
+        p.todos.push(Todo::new("two"));
+        store.projects.push(p);
+
+        a.offer_data_import(ImportedData {
+            store,
+            source: "me/notes/voido-data.json".into(),
+        });
+        match &a.mode {
+            Mode::Confirm(c) => {
+                assert!(matches!(c.action, ConfirmAction::ImportData(_)));
+                assert!(
+                    c.prompt.contains("1 project · 2 todos · 0 notes"),
+                    "{}",
+                    c.prompt
+                );
+                assert!(c.prompt.contains("me/notes/voido-data.json"));
+            }
+            _ => panic!("expected a confirmation"),
+        }
+        assert_eq!(
+            a.store.projects.len(),
+            before,
+            "data untouched until confirmed"
+        );
+    }
+}
+
+#[cfg(test)]
+mod import_settings_tests {
+    use super::*;
+
+    fn app() -> App {
+        App::new(Store::default(), Config::default(), None, None)
+    }
+
+    #[test]
+    fn menu_entry_opens_the_prompt() {
+        let mut a = app();
+        a.run_menu(MenuAction::ImportSettings);
+        match &a.mode {
+            Mode::Input(input) => {
+                assert!(matches!(input.action, InputAction::ImportSettings));
+                assert!(input.title.contains("owner/repo"));
+            }
+            _ => panic!("expected an input prompt"),
+        }
+    }
+
+    #[test]
+    fn a_bad_spec_never_starts_a_fetch() {
+        let mut a = app();
+        a.spawn_settings_fetch("not a repo");
+        assert!(a.status.contains("invalid repo"), "{}", a.status);
+        assert!(!a.settings_in_flight);
+        assert!(a.settings_rx.is_none());
+    }
+
+    #[test]
+    fn identical_settings_change_nothing() {
+        let mut a = app();
+        a.offer_settings_import(ImportedSettings {
+            config: Config::default(),
+            source: "me/dotfiles/config.toml".into(),
+        });
+        assert!(
+            matches!(a.mode, Mode::Normal),
+            "no confirmation when there's nothing to change"
+        );
+    }
+
+    #[test]
+    fn a_difference_asks_before_changing_anything() {
+        let mut a = app();
+        let incoming = Config {
+            theme: Some("dracula".into()),
+            ..Config::default()
+        };
+        a.offer_settings_import(ImportedSettings {
+            config: incoming,
+            source: "me/dotfiles/config.toml".into(),
+        });
+        match &a.mode {
+            Mode::Confirm(c) => {
+                assert!(matches!(c.action, ConfirmAction::ImportSettings(_)));
+                assert!(c.prompt.contains("me/dotfiles/config.toml"));
+                assert!(c.prompt.contains("dracula"), "{}", c.prompt);
+            }
+            _ => panic!("expected a confirmation"),
+        }
+        assert!(
+            a.config.theme.is_none(),
+            "settings untouched until confirmed"
+        );
     }
 }

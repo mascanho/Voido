@@ -29,6 +29,28 @@ use std::path::PathBuf;
 /// Data-file name used inside the sync repo when `github_file` isn't set.
 pub const DEFAULT_SYNC_FILE: &str = "voido-data.json";
 
+/// Paths tried, in order, when settings are imported from a repo that was named
+/// without a file — the usual places a dotfiles repo keeps them.
+pub const SETTINGS_CANDIDATES: &[&str] = &[
+    "config.toml",
+    "voido.toml",
+    "voido/config.toml",
+    ".config/voido/config.toml",
+    "config/voido/config.toml",
+    "config.json",
+];
+
+/// Paths tried, in order, when data is imported from a repo that was named
+/// without a file: the name voido syncs under, then the usual hand-made spots.
+/// A `github_file` override is tried ahead of these — see `App::data_candidates`.
+pub const DATA_CANDIDATES: &[&str] = &[
+    DEFAULT_SYNC_FILE,
+    "data/voido-data.json",
+    "voido/voido-data.json",
+    "voido.json",
+    "data.json",
+];
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
     /// `"local"` (default) or `"github"`.
@@ -86,6 +108,74 @@ impl Config {
             .filter(|s| !s.is_empty())
             .unwrap_or(DEFAULT_SYNC_FILE)
             .to_string()
+    }
+
+    /// Parse settings text fetched from somewhere other than the settings file
+    /// — TOML, falling back to the older JSON shape so a `config.json` kept in a
+    /// dotfiles repo still imports.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let toml_err = match toml::from_str::<Self>(text) {
+            Ok(c) => return Ok(c),
+            Err(e) => e,
+        };
+        serde_json::from_str::<Self>(text).map_err(|_| toml_err.to_string())
+    }
+
+    /// What adopting `incoming` would change, one line per key, for the import
+    /// confirmation. Empty means the two are already equivalent.
+    ///
+    /// `github_token` is never imported — a token in a repo is either a leak or
+    /// someone else's — so a token in `incoming` shows up as an explicit skip.
+    pub fn import_diff(&self, incoming: &Self) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut row = |key: &str, from: String, to: String| {
+            if from != to {
+                out.push(format!("{key:<12}  {from} → {to}"));
+            }
+        };
+        let show = |v: &Option<String>| match v.as_deref().map(str::trim) {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => "(unset)".to_string(),
+        };
+        let storage = |c: &Self| match c.storage {
+            StorageChoice::GitHub => "github".to_string(),
+            StorageChoice::Local => "local".to_string(),
+        };
+
+        row("storage", storage(self), storage(incoming));
+        row(
+            "sync repo",
+            show(&self.github_repo),
+            show(&incoming.github_repo),
+        );
+        row(
+            "sync file",
+            show(&self.github_file),
+            show(&incoming.github_file),
+        );
+        row("theme", show(&self.theme), show(&incoming.theme));
+        row("weather", show(&self.weather), show(&incoming.weather));
+        row(
+            "weather unit",
+            show(&self.weather_unit),
+            show(&incoming.weather_unit),
+        );
+        row(
+            "custom themes",
+            format!("{}", self.themes.len()),
+            format!("{}", incoming.themes.len()),
+        );
+        if incoming.github_token.is_some() {
+            out.push("github_token in the file is ignored (yours is kept)".into());
+        }
+        out
+    }
+
+    /// Replace these settings with `incoming`, keeping the local `github_token`.
+    pub fn apply_import(&mut self, incoming: Self) {
+        let token = self.github_token.take();
+        *self = incoming;
+        self.github_token = token;
     }
 }
 
@@ -171,7 +261,9 @@ const SETTINGS_HEADER: &str = "\
 #   weather       Place name, \"lat,lon\", or \"auto\" (IP-based). Empty = off.
 #   weather_unit  \"c\" (default) or \"f\".
 #
-# ^s fills in `storage` and `github_repo` for you.
+# ^s fills in `storage` and `github_repo` for you. ^k -> \"Settings from GitHub\"
+# replaces this file with one kept in a repo (your `github_token` is never
+# imported, and voido shows the changes before applying them).
 #
 # Custom themes are appended as [[themes]] tables (all slots #rrggbb; `on_accent`
 # optional, defaults to `bg`). The name is slugified for `theme`; reuse a
@@ -216,6 +308,64 @@ mod tests {
         assert_eq!(c.storage, StorageChoice::GitHub);
         assert!(c.github_repo.is_none());
         assert_eq!(c.sync_file(), DEFAULT_SYNC_FILE);
+    }
+
+    #[test]
+    fn parse_accepts_toml_and_legacy_json() {
+        let toml = Config::parse(r#"theme = "dracula""#).unwrap();
+        assert_eq!(toml.theme.as_deref(), Some("dracula"));
+
+        let json = Config::parse(r#"{"theme":"dracula","storage":"github"}"#).unwrap();
+        assert_eq!(json.theme.as_deref(), Some("dracula"));
+        assert_eq!(json.storage, StorageChoice::GitHub);
+
+        assert!(Config::parse("this is neither").is_err());
+    }
+
+    #[test]
+    fn import_reports_changes_and_keeps_the_local_token() {
+        let mut local = Config {
+            theme: Some("dracula".into()),
+            github_token: Some("local-secret".into()),
+            ..Config::default()
+        };
+        let incoming = Config {
+            storage: StorageChoice::GitHub,
+            github_repo: Some("me/notes".into()),
+            theme: Some("dracula".into()),
+            weather: Some("Lisbon".into()),
+            github_token: Some("theirs".into()),
+            ..Config::default()
+        };
+
+        let diff = local.import_diff(&incoming);
+        assert!(diff.iter().any(|l| l.starts_with("storage")));
+        assert!(diff.iter().any(|l| l.contains("me/notes")));
+        assert!(diff.iter().any(|l| l.contains("Lisbon")));
+        assert!(
+            !diff.iter().any(|l| l.starts_with("theme")),
+            "unchanged keys are left out: {diff:?}"
+        );
+        assert!(
+            diff.iter().any(|l| l.contains("github_token")),
+            "a token in the file is called out as skipped"
+        );
+
+        local.apply_import(incoming);
+        assert_eq!(local.github_token.as_deref(), Some("local-secret"));
+        assert_eq!(local.github_repo.as_deref(), Some("me/notes"));
+        assert_eq!(local.weather.as_deref(), Some("Lisbon"));
+        assert_eq!(local.storage, StorageChoice::GitHub);
+    }
+
+    #[test]
+    fn import_diff_is_empty_for_identical_settings() {
+        let c = Config {
+            theme: Some("dracula".into()),
+            weather: Some("Lisbon".into()),
+            ..Config::default()
+        };
+        assert!(c.import_diff(&c.clone()).is_empty());
     }
 
     #[test]

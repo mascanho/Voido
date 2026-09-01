@@ -47,7 +47,14 @@ pub fn render(f: &mut Frame, app: &App) {
         rows[1]
     };
 
-    if app.tab == Tab::Todos || app.tab == Tab::Notes {
+    if app.note_full
+        && !matches!(app.mode, Mode::EditBody(_))
+        && let Some((title, body, scroll)) = app.full_note_view()
+    {
+        // `^f` — the note fills the window; no rails, no lists.
+        rects.detail = body_rect;
+        render_full_note(f, body_rect, app, title, body, scroll);
+    } else if app.tab == Tab::Todos || app.tab == Tab::Notes {
         if app.tab == Tab::Notes && app.note_expanded && app.focus == Focus::Detail {
             // Full-width note mode — projects + note body (or its editor) only.
             let body = Layout::horizontal([Constraint::Percentage(30), Constraint::Percentage(70)])
@@ -358,7 +365,7 @@ fn render_content(f: &mut Frame, area: Rect, app: &App) {
 /// The bordered block for the middle pane. Its top border carries the tab strip
 /// (left) and the project name (right), so no separate tab row is needed.
 fn content_block(app: &App, width: u16) -> Block<'static> {
-    let focused = app.focus == Focus::Content;
+    let focused = app.content_lit();
 
     let mut spans = Vec::new();
     let mut tabs_w = 0usize;
@@ -882,9 +889,13 @@ fn render_detail_note(f: &mut Frame, area: Rect, app: &App, which: DetailNote) {
             None => return,
         },
     };
-    // The todo note owns the whole pane; the subtask note glows only while
-    // focus has been stepped into it.
-    let lit = matches!(which, DetailNote::Todo) || app.sub_note_focus;
+    // The todo note owns the whole pane, and wears the accent in place of the
+    // list it belongs to; the subtask note glows only while focus has been
+    // stepped into it. Either way exactly one pane is lit.
+    let lit = match which {
+        DetailNote::Todo => app.focus == Focus::Content,
+        DetailNote::Subtask(_) => app.sub_note_focus,
+    };
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -924,6 +935,62 @@ fn render_detail_note(f: &mut Frame, area: Rect, app: &App, which: DetailNote) {
             let r = Rect {
                 x: area.x + area.width - w - 1,
                 y: area.y,
+                width: w,
+                height: 1,
+            };
+            f.render_widget(
+                Paragraph::new(Span::styled(tag, Style::new().fg(subtle()))),
+                r,
+            );
+        }
+    }
+}
+
+/// `^f` — the note on screen, alone, filling the whole body area.
+fn render_full_note(f: &mut Frame, area: Rect, app: &App, title: String, body: &str, scroll: u16) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(accent()))
+        .title(Span::styled(
+            fit_title(title, area.width),
+            Style::new().fg(accent()).bold(),
+        ))
+        .title(
+            Line::from(Span::styled(
+                " j/k ^d/^u scroll · esc close ",
+                Style::new().fg(subtle()),
+            ))
+            .right_aligned(),
+        )
+        .padding(Padding::new(2, 2, 1, 1));
+
+    let inner = block.inner(area);
+    let rendered = app.note_body_lines(body, inner.width);
+    let total = rendered.len() as u16;
+    let max_scroll = total.saturating_sub(inner.height);
+    let scroll = scroll.min(max_scroll);
+
+    f.render_widget(
+        Paragraph::new(rendered)
+            .block(block)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0)),
+        area,
+    );
+
+    if total > inner.height {
+        let pct = if max_scroll == 0 {
+            100
+        } else {
+            (scroll as u32 * 100 / max_scroll as u32) as u16
+        };
+        let tag = format!(" {pct}% ");
+        let w = tag.chars().count() as u16;
+        if area.width > w + 2 && area.height > 1 {
+            let r = Rect {
+                x: area.x + area.width - w - 1,
+                y: area.y + area.height - 1,
                 width: w,
                 height: 1,
             };
@@ -1226,6 +1293,7 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
         | Mode::Menu(_) => ("N", accent()),
     };
     let pane_label = match app.focus {
+        _ if app.note_full => "NOTE·FULL",
         Focus::Projects => "PROJECTS",
         Focus::Content => match app.tab {
             Tab::Overview => "OVERVIEW",
@@ -1382,7 +1450,18 @@ fn render_notice(f: &mut Frame, area: Rect, title: &str, body: &str) {
         .split('\n')
         .map(|l| Line::from(Span::styled(l.to_string(), Style::new().fg(text()))))
         .collect();
-    let height = (lines.len() as u16 + 4).clamp(6, area.height.saturating_sub(2));
+    // Count the rows the text will occupy once wrapped, not just the newlines —
+    // GitHub's errors arrive as one long sentence.
+    let wrapped: usize = body
+        .split('\n')
+        .map(|l| {
+            l.chars()
+                .count()
+                .div_ceil((width as usize).saturating_sub(6).max(1))
+        })
+        .map(|rows| rows.max(1))
+        .sum();
+    let height = (wrapped as u16 + 4).clamp(6, area.height.saturating_sub(2));
     let rect = popup(area, width, height);
     overlay(f, rect);
 
@@ -1538,15 +1617,24 @@ fn render_weather(f: &mut Frame, area: Rect, app: &App) {
 
 fn render_confirm(f: &mut Frame, area: Rect, c: &ConfirmState) {
     let width = area.width.saturating_sub(8).clamp(24, 64);
-    let rect = popup(area, width, 7);
+    // Grow the box to fit a multi-line prompt (the settings-import diff), so the
+    // y/n row is never pushed out of the frame.
+    let prompt_w = (width as usize).saturating_sub(6).max(1);
+    let prompt_h: usize = c
+        .prompt
+        .split('\n')
+        .map(|l| l.chars().count().div_ceil(prompt_w).max(1))
+        .sum();
+    let height = (prompt_h as u16 + 6).min(area.height.saturating_sub(2));
+    let rect = popup(area, width, height);
     overlay(f, rect);
 
-    // A quit prompt isn't destructive — style it calmer than a delete.
-    let quit = matches!(c.action, ConfirmAction::Quit);
-    let (edge, title) = if quit {
-        (accent(), " Quit ")
-    } else {
-        (red(), " Confirm ")
+    // Quit and settings imports aren't destructive — style them calmer than a
+    // delete.
+    let (edge, title) = match c.action {
+        ConfirmAction::Quit => (accent(), " Quit "),
+        ConfirmAction::ImportSettings(_) => (accent(), " Import settings "),
+        _ => (red(), " Confirm "),
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1554,18 +1642,20 @@ fn render_confirm(f: &mut Frame, area: Rect, c: &ConfirmState) {
         .border_style(Style::new().fg(edge))
         .title(Span::styled(title, Style::new().fg(edge).bold()))
         .padding(Padding::new(2, 2, 1, 1));
-    let text = vec![
-        Line::from(Span::styled(c.prompt.clone(), Style::new().fg(text()))),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("y", Style::new().fg(green()).bold()),
-            Span::styled("  yes        ", Style::new().fg(subtle())),
-            Span::styled("n", Style::new().fg(red()).bold()),
-            Span::styled("  cancel", Style::new().fg(subtle())),
-        ]),
-    ];
+    let mut body: Vec<Line> = c
+        .prompt
+        .split('\n')
+        .map(|l| Line::from(Span::styled(l.to_string(), Style::new().fg(text()))))
+        .collect();
+    body.push(Line::from(""));
+    body.push(Line::from(vec![
+        Span::styled("y", Style::new().fg(green()).bold()),
+        Span::styled("  yes        ", Style::new().fg(subtle())),
+        Span::styled("n", Style::new().fg(red()).bold()),
+        Span::styled("  cancel", Style::new().fg(subtle())),
+    ]));
     f.render_widget(
-        Paragraph::new(text).wrap(Wrap { trim: true }).block(block),
+        Paragraph::new(body).wrap(Wrap { trim: true }).block(block),
         rect,
     );
 }
@@ -1632,6 +1722,7 @@ fn render_help(f: &mut Frame, area: Rect) {
         ("", "NOTE BODY / EDITOR"),
         ("j k ^d ^u", "scroll · page"),
         ("space", "expand / collapse"),
+        ("^f", "full-screen note (esc out)"),
         ("L", "links → open / copy"),
         ("e  ^s", "edit · save & close"),
     ];
@@ -2470,6 +2561,98 @@ fn popup(area: Rect, width: u16, height: u16) -> Rect {
 fn overlay(f: &mut Frame, rect: Rect) {
     f.render_widget(Clear, rect);
     f.render_widget(Block::default().style(Style::new().bg(bg())), rect);
+}
+
+#[cfg(test)]
+mod note_pane_tests {
+    use super::*;
+    use crate::app::{App, Focus, Tab};
+    use crate::config::Config;
+    use crate::model::{Project, Store, Todo};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+    use ratatui::style::Color;
+
+    /// One project, one todo carrying a note — enough to put a note on screen.
+    fn app_with_todo_note() -> App {
+        let mut project = Project::new("P");
+        let mut todo = Todo::new("write it up");
+        todo.note = "# Heading\n\nSome body text.".into();
+        project.todos.push(todo);
+        let mut store = Store::default();
+        store.projects.push(project);
+
+        let mut app = App::new(store, Config::default(), None, None);
+        app.tab = Tab::Todos;
+        app.focus = Focus::Content;
+        app.todo_note_open = true;
+        app
+    }
+
+    fn draw(app: &mut App) -> Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        app.clamp();
+        terminal.draw(|f| render(f, app)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    /// Colour of a pane's top-left corner — its border style.
+    fn corner(buf: &Buffer, r: Rect) -> Color {
+        buf[(r.x, r.y)].style().fg.unwrap()
+    }
+
+    #[test]
+    fn the_note_takes_the_accent_from_the_todo_list() {
+        let mut app = app_with_todo_note();
+        assert!(app.showing_todo_note(), "the note is on screen");
+        let buf = draw(&mut app);
+        let rects = *app.pane_rects.borrow();
+
+        assert_eq!(corner(&buf, rects.detail), accent(), "the note is lit");
+        assert_ne!(
+            corner(&buf, rects.content),
+            accent(),
+            "the todo list it belongs to steps back"
+        );
+    }
+
+    #[test]
+    fn the_todo_list_is_lit_again_once_the_note_is_closed() {
+        let mut app = app_with_todo_note();
+        app.todo_note_open = false;
+        let buf = draw(&mut app);
+        let rects = *app.pane_rects.borrow();
+        assert_eq!(corner(&buf, rects.content), accent());
+    }
+
+    #[test]
+    fn moving_to_the_projects_rail_dims_the_note_too() {
+        let mut app = app_with_todo_note();
+        app.focus = Focus::Projects;
+        let buf = draw(&mut app);
+        let rects = *app.pane_rects.borrow();
+        assert_eq!(corner(&buf, rects.projects), accent(), "one lit pane");
+        assert_ne!(corner(&buf, rects.detail), accent());
+    }
+
+    #[test]
+    fn a_full_screen_note_hides_the_panes() {
+        let mut app = app_with_todo_note();
+        app.note_full = true;
+        let buf = draw(&mut app);
+        let rects = *app.pane_rects.borrow();
+
+        assert_eq!(rects.projects.area(), 0, "no projects rail");
+        assert_eq!(rects.content.area(), 0, "no todo list");
+        assert!(rects.detail.width > 100, "the note has the whole width");
+
+        let top: String = (0..120)
+            .map(|x| buf[(x, rects.detail.y)].symbol())
+            .collect();
+        assert!(top.contains("Note · write it up"), "{top}");
+        assert!(top.contains("esc close"), "{top}");
+    }
 }
 
 #[cfg(test)]

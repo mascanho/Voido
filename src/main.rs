@@ -29,21 +29,10 @@ use ratatui::{
 use storage_sqlite::SqliteStorage;
 
 fn main() -> Result<(), Box<dyn Error>> {
-    migrate_legacy_dirs();
     let config = ensure_config()?;
-    theme::init(
-        config
-            .themes
-            .iter()
-            .filter_map(|spec| match spec.build() {
-                Ok(entry) => Some(entry),
-                Err(e) => {
-                    eprintln!("voido: ignoring custom theme \"{}\" — {e}", spec.name);
-                    None
-                }
-            })
-            .collect(),
-    );
+    for warning in theme::install_custom(&config.themes) {
+        eprintln!("voido: {warning}");
+    }
     theme::set_slug(config.theme.as_deref());
 
     let db = match SqliteStorage::open(&db_path()) {
@@ -166,23 +155,6 @@ fn ensure_config() -> Result<Config, Box<dyn Error>> {
     let config = Config::default();
     config.save()?;
     Ok(config)
-}
-
-/// Carry over data/config from the app's former name (`shiki`) so an existing
-/// install keeps working after the rename. Best-effort, runs once.
-fn migrate_legacy_dirs() {
-    for base in [dirs::data_dir(), dirs::config_dir()] {
-        let Some(base) = base else { continue };
-        let (old, new) = (base.join("shiki"), base.join("voido"));
-        if old.is_dir() && !new.exists() {
-            let _ = std::fs::rename(&old, &new);
-        }
-        // The database file was named after the app too.
-        let (old_db, new_db) = (new.join("shiki.db"), new.join("voido.db"));
-        if old_db.is_file() && !new_db.exists() {
-            let _ = std::fs::rename(&old_db, &new_db);
-        }
-    }
 }
 
 fn db_path() -> PathBuf {

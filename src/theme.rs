@@ -25,7 +25,7 @@
 //! `"my-theme"`); a custom theme whose slug matches a built-in replaces it.
 
 use std::cell::Cell;
-use std::sync::OnceLock;
+use std::sync::RwLock;
 
 use ratatui::style::Color;
 use serde::{Deserialize, Serialize};
@@ -552,14 +552,18 @@ fn slugify(s: &str) -> String {
 
 // ---- registry + active theme --------------------------------------------
 
-static REGISTRY: OnceLock<Vec<ThemeEntry>> = OnceLock::new();
+/// The live theme list. Entries are leaked so callers can hold `&'static`
+/// references to them; the list is rebuilt (and re-leaked) whenever the custom
+/// themes change, which happens at most a handful of times per run.
+static REGISTRY: RwLock<Option<&'static [ThemeEntry]>> = RwLock::new(None);
 
 thread_local! {
     static CURRENT: Cell<usize> = const { Cell::new(0) };
 }
 
 /// Build the theme list: built-ins plus any custom themes (a custom theme whose
-/// slug matches a built-in replaces it). Call once, before the first render.
+/// slug matches a built-in replaces it). Called at startup and again whenever a
+/// new settings file is adopted (`^e`, or an import from GitHub).
 pub fn init(custom: Vec<ThemeEntry>) {
     let mut list = builtin_entries();
     for entry in custom {
@@ -568,12 +572,46 @@ pub fn init(custom: Vec<ThemeEntry>) {
             None => list.push(entry),
         }
     }
-    let _ = REGISTRY.set(list);
+    let mut slot = write_registry();
+    *slot = Some(&*Box::leak(list.into_boxed_slice()));
+}
+
+/// Validate `specs` and install the ones that parse. Returns a message per
+/// rejected theme, for the caller to surface however it likes.
+pub fn install_custom(specs: &[ThemeSpec]) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let entries = specs
+        .iter()
+        .filter_map(|spec| match spec.build() {
+            Ok(entry) => Some(entry),
+            Err(e) => {
+                warnings.push(format!("ignoring custom theme \"{}\" — {e}", spec.name));
+                None
+            }
+        })
+        .collect();
+    init(entries);
+    warnings
 }
 
 /// Every theme, in picker order.
 pub fn registry() -> &'static [ThemeEntry] {
-    REGISTRY.get_or_init(builtin_entries)
+    if let Some(list) = *read_registry() {
+        return list;
+    }
+    // No settings loaded (tests, early paint): fall back to the built-ins.
+    let mut slot = write_registry();
+    slot.get_or_insert_with(|| Box::leak(builtin_entries().into_boxed_slice()))
+}
+
+// A poisoned lock only means some thread panicked mid-swap; the list itself is
+// still a valid `Option<&[ThemeEntry]>`, so recover rather than take the app down.
+fn read_registry() -> std::sync::RwLockReadGuard<'static, Option<&'static [ThemeEntry]>> {
+    REGISTRY.read().unwrap_or_else(|e| e.into_inner())
+}
+
+fn write_registry() -> std::sync::RwLockWriteGuard<'static, Option<&'static [ThemeEntry]>> {
+    REGISTRY.write().unwrap_or_else(|e| e.into_inner())
 }
 
 fn clamp(i: usize) -> usize {

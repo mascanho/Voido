@@ -164,7 +164,7 @@ and are otherwise silent. Leave `weather` unset for no network call at all.
 ### GitHub activity
 
 The resolved token also lifts the anonymous rate limit on the repo-activity view
-(`^g` to link a code repo, `o` to view).
+(`^g` to link a code repo, `R` in the projects rail to view).
 
 Each project gets its own icon in the rail (picked from its name, so it's stable
 between runs). The icon's colour is the status: dim = empty, accent = open
@@ -187,12 +187,16 @@ pane keeps its own `i` toggle, so expanding todos doesn't also expand the rail.
 ## Layout
 
 ```
- ╭ Projects ──────╮╭ Overview  Todos  Notes  Schedule ──── Website ╮╭ Subtasks 1/3 ╮
+ ╭ Projects ──────╮╭ Ovw  Todo  Note  Sched  Meet ──────── Website ╮╭ Subtasks 1/3 ╮
  │▍◈ Website  3/8 ││ ○ Design system in Figma        ↑  ⊞2/3    Sep 01││ ✔ Hero       │
  │ ◆ Voido      ✓ ││ ○ Rebuild the home page              ¶     Sep 09││ ○ Nav+footer │
  ╰────────────────╯╰──────────────────────────────────────────────╯╰──────────────╯
   N  TODOS         ☀ 16°C · Wed Aug 30 · 14:20         Website > todos
 ```
+
+The middle pane's top border is the tab strip; it falls back to short labels
+(`Ovw  Todo  Note  Sched  Meet`) whenever the pane is too narrow for the full
+titles, as it is in the three-pane views above.
 
 The footer carries the mode (`N`/`I`) and focused pane on the left, the weather +
 clock centred, and a breadcrumb on the right. One-off events (a finished sync, a
@@ -222,11 +226,11 @@ Press **`^l`** for the activity panel — a strip below the panes with two table
 (every data edit you've made this session, newest at the bottom). Session-only,
 not persisted. `^l` again hides it.
 
-- **Overview** — description, todo/subtask progress bar, note count, next milestone
+- **Overview** — description, todo/subtask progress bar, note count, next
+  milestone and next meeting
 - **Todos** — checkbox, priority, due date, subtask progress; `l` opens the
-  **Subtasks** pane on the right for the selected todo. `o` sorts the list by
-  priority — each press cycles which tier floats to the top (High → Medium → Low);
-  works the same way in the Subtasks pane. A todo that has subtasks is ticked
+  **Subtasks** pane on the right for the selected todo. `o` opens the **sort
+  menu** for the list in focus (see below). A todo that has subtasks is ticked
   automatically once they're all
   done (and un-ticked if one reopens). Each todo **and subtask** can carry a
   Markdown **note** (`¶`) and a list of **attachments** — links, files or images
@@ -253,6 +257,11 @@ not persisted. `^l` again hides it.
   the text count, not just `[markdown](links)`.
 - **Timeline** — every milestone (◆) plus every due-dated todo, sorted by date,
   with `overdue` / `in 3d` markers
+- **Meetings** — what's on the calendar for the project: date, start time and
+  who's in it, `● today` / `in 2d` / `3d ago` on the row, `✔` once it's been
+  held (`x`). `l` opens the meeting's **agenda / minutes** in the right pane —
+  the same Markdown pane the Notes tab uses, so `^f`, `L` and the editor (`N`)
+  all work on it. `i` shows the detail panel, `r` moves it, `o` reorders the list
 
 ## Keys
 
@@ -260,18 +269,37 @@ not persisted. `^l` again hides it.
 panes. Click a pane, tab, or row to jump there; the wheel scrolls. Press `?` any
 time for the full list.
 
+Each list has its own set of orderings, offered by **`o`**:
+
+| List | Orderings |
+| --- | --- |
+| Projects | name · next deadline · open todos · progress · created · tag |
+| Todos | priority · due date · name · status · progress · tag |
+| Subtasks | priority · name · status · tag |
+| Notes | pinned · name · note length |
+| Meetings | date · name · held · attendees |
+
+The menu opens on the ordering that list is already in (marked `↓`/`↑` for its
+direction); `r` reverses the highlighted one, `enter` applies it. Sorts are
+stable, so items that tie keep the order `J`/`K` put them in, and anything
+missing the value being sorted on (a todo with no due date, an untagged item)
+stays at the bottom either way.
+
 | Scope | Keys |
 | --- | --- |
-| Global | `h`/`l` switch pane · `w`/`s` prev/next project · `tab`/`S-tab` switch view · `1`‑`4` jump to a view · `gg`/`G` top/bottom · `esc` back out · `/` fuzzy find · `m` minimal view · `^k` main menu · `^l` activity panel · `^w` weather · `^t` theme · `^s` save to GitHub · `^e` edit settings file · `^f` full-screen the note on screen · `?` help · `q` quit (asks to confirm — `qq`, `y` or `enter`; `^c` quits straight away) |
-| Projects | `a` add · `r` rename · `d` delete · `l` open · `i` detail · `t` tags · `^g` link/unlink code repo · `o` repo activity |
+| Global | `h`/`l` switch pane · `w`/`s` prev/next project · `tab`/`S-tab` switch view · `1`‑`5` jump to a view · `gg`/`G` top/bottom · `esc` back out · `/` fuzzy find · `m` minimal view · `^k` main menu · `^l` activity panel · `^w` weather · `^t` theme · `^s` save to GitHub · `^e` edit settings file · `^f` full-screen the note on screen · `?` help · `q` quit (asks to confirm — `qq`, `y` or `enter`; `^c` quits straight away) |
+| Projects | `a` add · `r` rename · `d` delete · `l` open · `i` detail · `t` tags · `o` sort menu · `^g` link/unlink code repo · `R` repo activity |
 | Overview | `e` edit description · `r` rename · `t` tags |
-| Todos | `a` add · `e` edit · `d` delete · `x` (or space) done · `p` priority · `o` sort by priority (cycles High/Med/Low on top) · `J`/`K` reorder · `l` subtasks · `i` detail · `n` view note · `^f` full-screen it · `N` edit note · `t` tags · `A` attachments |
-| Subtasks | `a` add · `e` edit · `d` delete · `x` done · `p` priority · `o` sort by priority (cycles High/Med/Low on top) · `J`/`K` reorder · `i` detail · `n` view note · `N` edit note · `l` focus note (then `j`/`k` scroll, `h` back) · `t` tags · `A` attachments · `h` back |
+| Todos | `a` add · `e` edit · `d` delete · `x` (or space) done · `p` priority · `o` sort menu · `J`/`K` reorder · `l` subtasks · `i` detail · `n` view note · `^f` full-screen it · `N` edit note · `t` tags · `A` attachments |
+| Subtasks | `a` add · `e` edit · `d` delete · `x` done · `p` priority · `o` sort menu · `J`/`K` reorder · `i` detail · `n` view note · `N` edit note · `l` focus note (then `j`/`k` scroll, `h` back) · `t` tags · `A` attachments · `h` back |
 | Tags (`t`) | `a` add one or more (space-separated) · `d` remove the selected tag · `esc` close |
-| Notes | `a` add · `e` edit title · `d` delete · `x` pin · `J`/`K` reorder · `l` open body |
+| Sort (`o`) | `j`/`k` pick an ordering · `r` reverse it · `enter` apply · `esc` close |
+| Notes | `a` add · `e` edit title · `d` delete · `x` pin · `o` sort menu · `J`/`K` reorder · `l` open body |
 | Note body | `j`/`k` · `^d`/`^u` scroll · `space` expand · `^f` full screen · `e` edit · `h` back |
 | MD editor | type freely · `esc` / `^s` save & close |
 | Schedule | `a` add milestone · `e`/`d` edit/delete · `x` done · `r` reschedule · `f` cycle filter · `l` jump to todo |
+| Meetings | `a` add · `e` edit · `d` delete · `x` held · `r` reschedule · `o` sort menu · `J`/`K` reorder · `i` detail · `l` read the notes · `N` edit them |
+| Meeting notes | `j`/`k` · `^d`/`^u` scroll · `^f` full screen · `e`/`N` edit · `h` back |
 | Find (`/`) | fuzzy-match projects, todos, subtasks, notes & their tags — each hit shows its type glyph, indent depth, and `project › todo` path; a project hit also shows its todo count (`8 todos · 2 overdue`, overdue in red) and a todo hit its subtask progress (`↳ 2/5`) · `↑`/`↓` or `^n`/`^p` move · `enter` jump · `esc` cancel |
 | Attachments (`A`) | `a` add a URL or path (append `\| label` to name it) · `o`/`enter` open with the system opener · `d` remove · `esc` close |
 
@@ -296,3 +324,13 @@ project / todo / subtask (or from the Overview) — a small panel where `a` adds
 one or more space-separated tags and `d` removes the highlighted one.
 
 For milestones, add `@YYYY-MM-DD` for the date (defaults to today).
+
+Meetings take a date, a start time and attendees:
+
+```
+Design review @2026-09-05 14:30 +ana +sam
+```
+
+- `@YYYY-MM-DD` — the day (defaults to today)
+- `14:30` — the start time (optional; `9:05` works too)
+- `+name` — an attendee; repeatable, and the same name twice counts once

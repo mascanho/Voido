@@ -228,6 +228,46 @@ pub struct Milestone {
     pub done: bool,
 }
 
+/// A meeting on a project: when it is (or was), who's in it, and the Markdown
+/// agenda / minutes that go with it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Meeting {
+    pub title: String,
+    pub date: NaiveDate,
+    /// Start time as `HH:MM`, when one was given.
+    #[serde(default)]
+    pub time: Option<String>,
+    #[serde(default)]
+    pub attendees: Vec<String>,
+    /// Agenda before the meeting, minutes after it.
+    #[serde(default)]
+    pub note: String,
+    /// Ticked once the meeting has been held.
+    #[serde(default)]
+    pub held: bool,
+}
+
+impl Meeting {
+    pub fn new(title: impl Into<String>, date: NaiveDate) -> Self {
+        Self {
+            title: title.into(),
+            date,
+            time: None,
+            attendees: Vec::new(),
+            note: String::new(),
+            held: false,
+        }
+    }
+
+    /// `Mon 14:30` style stamp for the lists — the time only when it has one.
+    pub fn when(&self) -> String {
+        match &self.time {
+            Some(t) => format!("{} {t}", self.date.format("%b %d")),
+            None => self.date.format("%b %d").to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Note {
     /// One-line title shown in the notes list.
@@ -268,6 +308,8 @@ pub struct Project {
     #[serde(default)]
     pub milestones: Vec<Milestone>,
     #[serde(default)]
+    pub meetings: Vec<Meeting>,
+    #[serde(default)]
     pub tags: Vec<String>,
     #[serde(default = "default_date")]
     pub created: NaiveDate,
@@ -286,6 +328,7 @@ impl Project {
             todos: Vec::new(),
             notes: Vec::new(),
             milestones: Vec::new(),
+            meetings: Vec::new(),
             tags: Vec::new(),
             created: chrono::Local::now().date_naive(),
         }
@@ -333,6 +376,14 @@ impl Project {
 
     pub fn note_count(&self) -> usize {
         self.notes.len()
+    }
+
+    /// The soonest meeting that hasn't been held yet, if any.
+    pub fn next_meeting(&self) -> Option<&Meeting> {
+        self.meetings
+            .iter()
+            .filter(|m| !m.held)
+            .min_by_key(|m| (m.date, m.time.clone()))
     }
 }
 
@@ -391,6 +442,28 @@ See the [thread](mailto:team@example.com) for the full notes.
             Note::new("Bolder hero — Q3 review notes", true).with_body(hero_body),
             Note::new("Reuse the icon set from the app", false),
         ];
+        let mut review = Meeting::new("Design review with marketing", day(2));
+        review.time = Some("14:30".into());
+        review.attendees = vec!["Ana".into(), "Priya".into(), "You".into()];
+        review.note = "\
+# Agenda
+
+1. Hero direction — pick one of the three comps
+2. Announcement bar: keep or cut?
+3. Launch date sanity check
+
+## Notes
+
+_Fill these in as we go._
+"
+        .to_string();
+        let mut standup = Meeting::new("Weekly standup", day(-3));
+        standup.time = Some("09:15".into());
+        standup.attendees = vec!["Ana".into(), "You".into()];
+        standup.held = true;
+        standup.note =
+            "- Figma library is unblocked\n- Staging deploy slipped to next week\n".to_string();
+        website.meetings = vec![standup, review];
         website.milestones = vec![
             Milestone {
                 title: "Design review".into(),
@@ -416,6 +489,10 @@ See the [thread](mailto:team@example.com) for the full notes.
                 "# Keymap\n\nKeep it **close to Vim** — no surprises.\n\n- `hjkl` everywhere\n- `gg` / `G` to jump\n- `d` always asks first\n",
             ),
         ];
+        let mut retro = Meeting::new("v0.1 retro", day(8));
+        retro.time = Some("16:00".into());
+        retro.attendees = vec!["You".into()];
+        cli.meetings = vec![retro];
         cli.milestones = vec![Milestone {
             title: "v0.1 release".into(),
             date: day(7),

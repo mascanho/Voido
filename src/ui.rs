@@ -7,17 +7,17 @@ use ratatui::{
     style::{Modifier, Style, Stylize},
     text::{Line, Span},
     widgets::{
-        Block, BorderType, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Row, Table,
-        Wrap,
+        Block, BorderType, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Row,
+        Table, Wrap,
     },
 };
 
 use crate::app::{
     App, AttachState, ConfirmAction, ConfirmState, DetailNote, EditTarget, Focus, InputState,
-    LinksState, LogEntry, MenuAction, MenuState, Mode, PaneRects, SearchState, SearchTarget, Tab,
-    TagState, TagTarget, ThemeState, TlKind, Toast, ToastKind,
+    LinksState, LogEntry, MenuAction, MenuState, Mode, PaneRects, SearchState, SearchTarget,
+    SortState, Tab, TagState, TagTarget, ThemeState, TlKind, Toast, ToastKind,
 };
-use crate::model::{AttachmentKind, Priority};
+use crate::model::{AttachmentKind, Meeting, Priority};
 use crate::theme::{accent, bg, blue, border, green, on_accent, red, sel_bg, subtle, text, yellow};
 use crate::util::truncate;
 
@@ -39,8 +39,7 @@ pub fn render(f: &mut Frame, app: &App) {
     // The `^l` activity panel eats a strip off the bottom of the body.
     let body_rect = if app.activity_open {
         let h = (rows[1].height / 3).clamp(6, 16);
-        let split =
-            Layout::vertical([Constraint::Min(3), Constraint::Length(h)]).split(rows[1]);
+        let split = Layout::vertical([Constraint::Min(3), Constraint::Length(h)]).split(rows[1]);
         render_activity(f, split[1], app);
         split[0]
     } else {
@@ -54,7 +53,7 @@ pub fn render(f: &mut Frame, app: &App) {
         // `^f` — the note fills the window; no rails, no lists.
         rects.detail = body_rect;
         render_full_note(f, body_rect, app, title, body, scroll);
-    } else if app.tab == Tab::Todos || app.tab == Tab::Notes {
+    } else if app.tab == Tab::Todos || app.tab == Tab::Notes || app.tab == Tab::Meetings {
         if app.tab == Tab::Notes && app.note_expanded && app.focus == Focus::Detail {
             // Full-width note mode — projects + note body (or its editor) only.
             let body = Layout::horizontal([Constraint::Percentage(30), Constraint::Percentage(70)])
@@ -88,16 +87,14 @@ pub fn render(f: &mut Frame, app: &App) {
                 (_, Tab::Todos) if app.showing_sub_note() && body[2].height >= 8 => {
                     // `n` in the Subtasks pane: the subtask's note sits in a
                     // section below the still-visible subtask list (4th pane).
-                    let split = Layout::vertical([
-                        Constraint::Min(4),
-                        Constraint::Percentage(42),
-                    ])
-                    .split(body[2]);
+                    let split = Layout::vertical([Constraint::Min(4), Constraint::Percentage(42)])
+                        .split(body[2]);
                     rects.detail = split[0];
                     render_subtasks(f, split[0], app);
                     render_detail_note(f, split[1], app, DetailNote::Subtask(app.subtask_idx));
                 }
                 (_, Tab::Todos) => render_subtasks(f, body[2], app),
+                (_, Tab::Meetings) => render_meeting_note(f, body[2], app),
                 _ => render_note_body(f, body[2], app),
             }
         }
@@ -126,6 +123,7 @@ pub fn render(f: &mut Frame, app: &App) {
         Mode::Tags(state) => render_tags(f, area, state, app),
         Mode::Links(state) => render_links(f, area, state),
         Mode::Menu(state) => render_menu(f, area, state),
+        Mode::Sort(state) => render_sort(f, area, state),
         Mode::Search(state) => render_search(f, area, state, app),
         Mode::EditBody(_) => {}
         Mode::Normal => {}
@@ -139,34 +137,58 @@ pub fn render(f: &mut Frame, app: &App) {
 fn render_header(f: &mut Frame, area: Rect, app: &App) {
     let n = app.store.projects.len();
 
-    let mut spans = vec![Span::styled("  voido", Style::new().fg(accent()).bold())];
-    if !app.minimal {
-        let done = app
-            .store
-            .projects
-            .iter()
-            .filter(|p| p.is_complete())
-            .count();
-        let count = if done > 0 {
-            format!(
-                "  ·  {n} project{}  ·  {done} done",
-                if n == 1 { "" } else { "s" }
-            )
-        } else {
-            format!("  ·  {n} project{}", if n == 1 { "" } else { "s" })
-        };
-        spans.push(Span::styled(count, Style::new().fg(subtle())));
+    let name = Span::styled("  voido", Style::new().fg(accent()).bold());
+    let name_w = name.content.chars().count() as u16;
+    f.render_widget(Paragraph::new(Line::from(name)), area);
 
-        // Overdue items in the current project, so it's visible from anywhere.
-        let (_, _, overdue, _, _) = app.deadline_stats();
-        if overdue > 0 {
-            spans.push(Span::styled(
-                format!("  ·  {overdue} overdue"),
-                Style::new().fg(red()).bold(),
-            ));
-        }
+    if app.minimal {
+        return;
     }
-    f.render_widget(Paragraph::new(Line::from(spans)), area);
+
+    // Everything else hugs the right edge, mirroring the footer's breadcrumb.
+    // Least useful segment first: a narrow terminal drops them from the front,
+    // so the overdue count is the last thing to go.
+    let done = app
+        .store
+        .projects
+        .iter()
+        .filter(|p| p.is_complete())
+        .count();
+    let (_, _, overdue, _, _) = app.deadline_stats();
+    let mut segs: Vec<(String, Style)> = vec![(
+        format!("{n} project{}", if n == 1 { "" } else { "s" }),
+        Style::new().fg(subtle()),
+    )];
+    if done > 0 {
+        segs.push((format!("{done} done"), Style::new().fg(subtle())));
+    }
+    if overdue > 0 {
+        segs.push((format!("{overdue} overdue"), Style::new().fg(red()).bold()));
+    }
+
+    // Width of the segments still in, separators and the right-hand gap.
+    let width_of = |segs: &[(String, Style)]| -> u16 {
+        let text: usize = segs.iter().map(|(t, _)| t.chars().count()).sum();
+        let seps = segs.len().saturating_sub(1) * 5;
+        (text + seps + 2) as u16
+    };
+    let room = area.width.saturating_sub(name_w + 2);
+    while !segs.is_empty() && width_of(&segs) > room {
+        segs.remove(0);
+    }
+    if segs.is_empty() {
+        return;
+    }
+
+    let mut spans = Vec::new();
+    for (i, (text, style)) in segs.into_iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled("  ·  ", Style::new().fg(subtle())));
+        }
+        spans.push(Span::styled(text, style));
+    }
+    spans.push(Span::raw("  "));
+    f.render_widget(Paragraph::new(Line::from(spans).right_aligned()), area);
 }
 
 /// Weather glyph + temperature and the clock, as one line — shown centred in the
@@ -226,7 +248,9 @@ fn render_projects(f: &mut Frame, area: Rect, app: &App) {
             let (icon_color, name_style) = if complete {
                 (
                     green(),
-                    Style::new().fg(subtle()).add_modifier(Modifier::CROSSED_OUT),
+                    Style::new()
+                        .fg(subtle())
+                        .add_modifier(Modifier::CROSSED_OUT),
                 )
             } else if is_empty {
                 (subtle(), Style::new().fg(subtle()))
@@ -243,7 +267,10 @@ fn render_projects(f: &mut Frame, area: Rect, app: &App) {
             } else if open == 0 {
                 (format!("{total}/{total}"), Style::new().fg(green()))
             } else {
-                (format!("{}/{total}", total - open), Style::new().fg(subtle()))
+                (
+                    format!("{}/{total}", total - open),
+                    Style::new().fg(subtle()),
+                )
             };
 
             RowSpec {
@@ -359,6 +386,7 @@ fn render_content(f: &mut Frame, area: Rect, app: &App) {
         Tab::Todos => render_todos(f, area, app),
         Tab::Notes => render_notes(f, area, app),
         Tab::Schedule => render_timeline(f, area, app),
+        Tab::Meetings => render_meetings(f, area, app),
     }
 }
 
@@ -378,7 +406,7 @@ fn content_block(app: &App, width: u16) -> Block<'static> {
         } else {
             Style::new().fg(border())
         };
-        let label = format!(" {} ", t.title());
+        let label = format!(" {} ", t.strip_label(width));
         tabs_w += label.chars().count();
         spans.push(Span::styled(label, style));
     }
@@ -485,6 +513,13 @@ fn render_overview(f: &mut Frame, area: Rect, app: &App) {
             stat(md, p.milestones.len()),
         ]));
     }
+    if !p.meetings.is_empty() {
+        let held = p.meetings.iter().filter(|m| m.held).count();
+        lines.push(Line::from(vec![
+            label("Meetings"),
+            stat(held, p.meetings.len()),
+        ]));
+    }
     lines.push(Line::from(""));
 
     match p.next_milestone() {
@@ -501,6 +536,18 @@ fn render_overview(f: &mut Frame, area: Rect, app: &App) {
             label("Next"),
             Span::styled("no upcoming milestones", Style::new().fg(subtle())),
         ])),
+    }
+
+    if let Some(m) = p.next_meeting() {
+        lines.push(Line::from(vec![
+            label("Meeting"),
+            Span::styled("\u{f0c0} ", Style::new().fg(accent())),
+            Span::styled(m.title.clone(), Style::new().fg(text())),
+            Span::styled(
+                format!("   {} · {}", m.date.format("%b %d"), meeting_rel(m, today)),
+                Style::new().fg(subtle()),
+            ),
+        ]));
     }
 
     if let Some(w) = &app.weather {
@@ -614,7 +661,11 @@ fn render_todos(f: &mut Frame, area: Rect, app: &App) {
     }
 
     let today = Local::now().date_naive();
-    let block = match project.todos.get(app.todo_idx).and_then(|t| t.due.map(|d| (t, d))) {
+    let block = match project
+        .todos
+        .get(app.todo_idx)
+        .and_then(|t| t.due.map(|d| (t, d)))
+    {
         Some((t, d)) => {
             let style = if !t.done && d < today {
                 Style::new().fg(red()).bold()
@@ -765,7 +816,10 @@ fn render_subtasks(f: &mut Frame, area: Rect, app: &App) {
     };
     // Give the parent name whatever the pane width leaves after the fixed parts.
     let fixed = " Subtasks ·  ".chars().count() + counts.chars().count() + markers.chars().count();
-    let name = truncate(&todo.title, (area.width as usize).saturating_sub(fixed + 3).max(8));
+    let name = truncate(
+        &todo.title,
+        (area.width as usize).saturating_sub(fixed + 3).max(8),
+    );
     let block = panel(format!(" Subtasks · {name}{counts}{markers} "), focused);
 
     let today = Local::now().date_naive();
@@ -1002,6 +1056,187 @@ fn render_full_note(f: &mut Frame, area: Rect, app: &App, title: String, body: &
     }
 }
 
+/// The Meetings tab: one row per meeting, soonest at whatever position `J`/`K`
+/// or the `o` menu put it in.
+fn render_meetings(f: &mut Frame, area: Rect, app: &App) {
+    let focused = app.focus == Focus::Content && app.tab == Tab::Meetings;
+    let block = content_block(app, area.width);
+
+    let Some(project) = app.current_project() else {
+        f.render_widget(
+            hint("Create a project to start booking meetings.").block(block),
+            area,
+        );
+        return;
+    };
+    if project.meetings.is_empty() {
+        f.render_widget(
+            hint("No meetings yet.  Press a to add one.").block(block),
+            area,
+        );
+        return;
+    }
+
+    let today = Local::now().date_naive();
+    // Bottom border: how far off the selected meeting is.
+    let block = match project.meetings.get(app.meeting_idx) {
+        Some(m) => {
+            let style = if m.held {
+                Style::new().fg(subtle())
+            } else if m.date == today {
+                Style::new().fg(green()).bold()
+            } else if m.date < today {
+                Style::new().fg(red())
+            } else {
+                Style::new().fg(subtle())
+            };
+            block.title_bottom(Line::from(Span::styled(
+                format!(" {} ", meeting_rel(m, today)),
+                style,
+            )))
+        }
+        None => block,
+    };
+
+    let inner_w = list_inner_w(area);
+    let show_when = inner_w >= 24;
+    let show_people = inner_w >= 34;
+    let specs: Vec<RowSpec> = project
+        .meetings
+        .iter()
+        .map(|m| {
+            let (mark, mark_style) = if m.held {
+                ("✔ ", Style::new().fg(green()))
+            } else if m.date == today {
+                ("● ", Style::new().fg(green()))
+            } else if m.date < today {
+                ("● ", Style::new().fg(red()))
+            } else {
+                ("○ ", Style::new().fg(subtle()))
+            };
+            let title_style = if m.held {
+                Style::new()
+                    .fg(subtle())
+                    .add_modifier(Modifier::CROSSED_OUT)
+            } else {
+                Style::new().fg(text())
+            };
+
+            let mut cells = Vec::new();
+            if show_people {
+                let people = if m.attendees.is_empty() {
+                    (String::new(), Style::default())
+                } else {
+                    (
+                        format!("\u{f0c0}{}", m.attendees.len()),
+                        Style::new().fg(subtle()),
+                    )
+                };
+                cells.push(people);
+                let note = if m.note.trim().is_empty() {
+                    (String::new(), Style::default())
+                } else {
+                    ("¶".to_string(), Style::new().fg(subtle()))
+                };
+                cells.push(note);
+            }
+            if show_when {
+                let style = if m.held {
+                    Style::new().fg(subtle())
+                } else if m.date == today {
+                    Style::new().fg(green())
+                } else if m.date < today {
+                    Style::new().fg(red())
+                } else {
+                    Style::new().fg(blue())
+                };
+                cells.push((m.when(), style));
+            }
+
+            RowSpec {
+                prefix: vec![Span::styled(mark, mark_style)],
+                title: m.title.clone(),
+                title_style,
+                cells,
+            }
+        })
+        .collect();
+
+    let mut items: Vec<ListItem> = Vec::with_capacity(project.meetings.len());
+    for (i, line) in meta_rows(inner_w, specs).into_iter().enumerate() {
+        let mut lines = vec![line];
+        if app.meeting_info && i == app.meeting_idx {
+            lines.extend(meeting_detail_lines(&project.meetings[i], today));
+        }
+        items.push(ListItem::new(lines));
+    }
+
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(if focused {
+            Style::new().bg(sel_bg()).bold()
+        } else {
+            Style::new().bg(sel_bg())
+        })
+        .highlight_symbol(if focused { "▍" } else { " " });
+    let mut state = ListState::default();
+    state.select(Some(app.meeting_idx));
+    f.render_stateful_widget(list, area, &mut state);
+}
+
+/// The third pane on the Meetings tab: the selected meeting's agenda / minutes.
+fn render_meeting_note(f: &mut Frame, area: Rect, app: &App) {
+    let focused = app.focus == Focus::Detail;
+
+    let Some(m) = app.current_meeting() else {
+        let block = panel(" Meeting ".to_string(), focused);
+        f.render_widget(
+            hint("Pick a meeting and press l to read its notes.").block(block),
+            area,
+        );
+        return;
+    };
+
+    let block = panel(
+        fit_title(format!(" {} · {} ", m.title, m.when()), area.width),
+        focused,
+    )
+    .padding(Padding::horizontal(1));
+
+    // Who's in it sits on the bottom border, where the list keeps its own dates.
+    let block = if m.attendees.is_empty() {
+        block
+    } else {
+        block.title_bottom(Line::from(Span::styled(
+            format!(" \u{f0c0} {} ", m.attendees.join(", ")),
+            Style::new().fg(subtle()),
+        )))
+    };
+
+    if m.note.trim().is_empty() {
+        f.render_widget(
+            hint("No agenda yet.  Press N to write one in Markdown.").block(block),
+            area,
+        );
+        return;
+    }
+
+    let rendered = app.note_body_lines(&m.note, area.width.saturating_sub(4));
+    let total = rendered.len() as u16;
+    let view = area.height.saturating_sub(2).max(1);
+    let max_scroll = total.saturating_sub(view);
+    let scroll = app.meeting_note_scroll.min(max_scroll);
+
+    f.render_widget(
+        Paragraph::new(rendered)
+            .block(block)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0)),
+        area,
+    );
+    render_scroll_pct(f, area, scroll, max_scroll, total > view);
+}
+
 fn render_note_body(f: &mut Frame, area: Rect, app: &App) {
     let focused = app.focus == Focus::Detail;
 
@@ -1039,27 +1274,33 @@ fn render_note_body(f: &mut Frame, area: Rect, app: &App) {
         .wrap(Wrap { trim: false })
         .scroll((scroll, 0));
     f.render_widget(para, area);
+    render_scroll_pct(f, area, scroll, max_scroll, total > view);
+}
 
-    if total > view {
-        let pct = if max_scroll == 0 {
-            100
-        } else {
-            (scroll as u32 * 100 / max_scroll as u32) as u16
+/// `42%` in the pane's top-right corner, so a long note says how much is left.
+/// Drawn only when the body actually overflows the pane.
+fn render_scroll_pct(f: &mut Frame, area: Rect, scroll: u16, max_scroll: u16, overflows: bool) {
+    if !overflows {
+        return;
+    }
+    let pct = if max_scroll == 0 {
+        100
+    } else {
+        (scroll as u32 * 100 / max_scroll as u32) as u16
+    };
+    let tag = format!(" {pct}% ");
+    let w = tag.chars().count() as u16;
+    if area.width > w + 2 {
+        let r = Rect {
+            x: area.x + area.width - w - 1,
+            y: area.y,
+            width: w,
+            height: 1,
         };
-        let tag = format!(" {pct}% ");
-        let w = tag.chars().count() as u16;
-        if area.width > w + 2 {
-            let r = Rect {
-                x: area.x + area.width - w - 1,
-                y: area.y,
-                width: w,
-                height: 1,
-            };
-            f.render_widget(
-                Paragraph::new(Span::styled(tag, Style::new().fg(subtle()))),
-                r,
-            );
-        }
+        f.render_widget(
+            Paragraph::new(Span::styled(tag, Style::new().fg(subtle()))),
+            r,
+        );
     }
 }
 
@@ -1078,6 +1319,10 @@ fn render_edit_body_pane(f: &mut Frame, area: Rect, state: &crate::app::EditStat
             .and_then(|t| t.subtasks.get(i))
             .map(|s| format!("note · {}", s.title))
             .unwrap_or_else(|| "subtask note".into()),
+        EditTarget::MeetingNote(_) => app
+            .current_meeting()
+            .map(|m| format!("meeting · {}", m.title))
+            .unwrap_or_else(|| "meeting notes".into()),
     };
 
     let split = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).split(area);
@@ -1271,8 +1516,7 @@ fn render_log_table(f: &mut Frame, area: Rect, title: &str, entries: &[LogEntry]
             Line::from(Span::styled(e.text.clone(), Style::new().fg(text()))),
         ])
     });
-    let table =
-        Table::new(rows, [Constraint::Length(8), Constraint::Min(0)]).block(block);
+    let table = Table::new(rows, [Constraint::Length(8), Constraint::Min(0)]).block(block);
     f.render_widget(table, area);
 }
 
@@ -1290,7 +1534,8 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
         | Mode::Attach(_)
         | Mode::Tags(_)
         | Mode::Links(_)
-        | Mode::Menu(_) => ("N", accent()),
+        | Mode::Menu(_)
+        | Mode::Sort(_) => ("N", accent()),
     };
     let pane_label = match app.focus {
         _ if app.note_full => "NOTE·FULL",
@@ -1300,9 +1545,11 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
             Tab::Todos => "TODOS",
             Tab::Notes => "NOTES",
             Tab::Schedule => "SCHEDULE",
+            Tab::Meetings => "MEETINGS",
         },
         Focus::Detail => match app.tab {
             Tab::Notes => "NOTE",
+            Tab::Meetings => "MINUTES",
             _ if app.sub_note_focus => "SUB·NOTE",
             _ => "SUBTASKS",
         },
@@ -1392,6 +1639,7 @@ fn build_breadcrumb(app: &App) -> String {
             Tab::Todos => parts.push("todos".into()),
             Tab::Notes => parts.push("notes".into()),
             Tab::Schedule => parts.push("schedule".into()),
+            Tab::Meetings => parts.push("meetings".into()),
         },
         Focus::Detail => match app.tab {
             Tab::Todos => {
@@ -1411,6 +1659,12 @@ fn build_breadcrumb(app: &App) -> String {
                 parts.push("notes".into());
                 if let Some(n) = app.current_note() {
                     parts.push(truncate(&n.text, 20));
+                }
+            }
+            Tab::Meetings => {
+                parts.push("meetings".into());
+                if let Some(m) = app.current_meeting() {
+                    parts.push(truncate(&m.title, 20));
                 }
             }
             _ => {}
@@ -1536,7 +1790,10 @@ fn render_weather(f: &mut Frame, area: Rect, app: &App) {
                 format!("  {}  ", w.glyph()),
                 Style::new().fg(accent()).bold(),
             ),
-            Span::styled(format!("{}°{u}", w.temp_i()), Style::new().fg(text()).bold()),
+            Span::styled(
+                format!("{}°{u}", w.temp_i()),
+                Style::new().fg(text()).bold(),
+            ),
             Span::styled(format!("   {}", w.label()), Style::new().fg(text())),
         ]),
         sub(format!(
@@ -1672,7 +1929,7 @@ fn render_help(f: &mut Frame, area: Rect) {
         ("esc", "step back · close"),
         ("", ""),
         ("", "VIEWS"),
-        ("1 2 3 4", "Overview·Todos·Notes·Sched"),
+        ("1 … 5", "views, strip order"),
         ("tab S-tab", "cycle view"),
         ("/", "fuzzy find"),
         ("m", "minimal view"),
@@ -1690,7 +1947,7 @@ fn render_help(f: &mut Frame, area: Rect) {
         ("l", "open"),
         ("i", "detail panel"),
         ("t", "tags"),
-        ("o", "repo activity"),
+        ("o  R", "sort · repo view"),
         ("", ""),
         ("", "OVERVIEW"),
         ("e  r", "description · rename"),
@@ -1702,12 +1959,18 @@ fn render_help(f: &mut Frame, area: Rect) {
         ("x  r", "done · reschedule"),
         ("f", "cycle filter"),
         ("l", "jump to todo"),
+        ("", ""),
+        ("", "MEETINGS"),
+        ("a e d", "add · edit · del"),
+        ("x  r", "held · reschedule"),
+        ("l  N", "read · edit notes"),
+        ("i  o", "detail · sort"),
     ];
     const COL3: &[Row] = &[
         ("", "TODOS · SUBTASKS"),
         ("a e d", "add · edit · delete"),
         ("x  space", "toggle done"),
-        ("p  o", "cycle priority · sort by it"),
+        ("p  o", "priority · sort"),
         ("l", "open subtasks"),
         ("i", "detail panel"),
         ("n  N", "view · edit note"),
@@ -1717,6 +1980,7 @@ fn render_help(f: &mut Frame, area: Rect) {
         ("", "NOTES"),
         ("a e d", "add · edit · delete"),
         ("x", "pin / unpin"),
+        ("o", "sort menu"),
         ("l", "open body"),
         ("", ""),
         ("", "NOTE BODY / EDITOR"),
@@ -1737,10 +2001,16 @@ fn render_help(f: &mut Frame, area: Rect) {
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(accent()))
-        .title(Span::styled(" Keybindings ", Style::new().fg(accent()).bold()))
+        .title(Span::styled(
+            " Keybindings ",
+            Style::new().fg(accent()).bold(),
+        ))
         .title(
-            Line::from(Span::styled(" any key to close ", Style::new().fg(subtle())))
-                .right_aligned(),
+            Line::from(Span::styled(
+                " any key to close ",
+                Style::new().fg(subtle()),
+            ))
+            .right_aligned(),
         )
         .padding(Padding::symmetric(2, 1));
     let inner = block.inner(rect);
@@ -1789,7 +2059,9 @@ fn render_help(f: &mut Frame, area: Rect) {
             Span::styled("@YYYY-MM-DD", Style::new().fg(text())),
             Span::styled(" due     ", Style::new().fg(subtle())),
             Span::styled("#tag", Style::new().fg(text())),
-            Span::styled(" tag", Style::new().fg(subtle())),
+            Span::styled(" tag     ", Style::new().fg(subtle())),
+            Span::styled("14:30 +person", Style::new().fg(text())),
+            Span::styled(" meeting", Style::new().fg(subtle())),
         ])),
         body[1],
     );
@@ -2067,11 +2339,7 @@ fn render_tags(f: &mut Frame, area: Rect, state: &TagState, app: &App) {
             Style::new().fg(accent()).bold(),
         ))
         .title(
-            Line::from(Span::styled(
-                " a add · d del ",
-                Style::new().fg(subtle()),
-            ))
-            .right_aligned(),
+            Line::from(Span::styled(" a add · d del ", Style::new().fg(subtle()))).right_aligned(),
         )
         .padding(Padding::symmetric(2, 1));
     let inner = block.inner(rect);
@@ -2091,7 +2359,12 @@ fn render_tags(f: &mut Frame, area: Rect, state: &TagState, app: &App) {
 
     let items: Vec<ListItem> = tags
         .iter()
-        .map(|t| ListItem::new(Line::from(Span::styled(format!("#{t}"), Style::new().fg(blue())))))
+        .map(|t| {
+            ListItem::new(Line::from(Span::styled(
+                format!("#{t}"),
+                Style::new().fg(blue()),
+            )))
+        })
         .collect();
     let list = List::new(items)
         .highlight_style(Style::new().bg(sel_bg()).bold())
@@ -2327,6 +2600,79 @@ fn render_menu(f: &mut Frame, area: Rect, state: &MenuState) {
     f.render_stateful_widget(list, inner, &mut ls);
 }
 
+/// The `o` ordering menu: the orderings the list in focus offers, each spelling
+/// out which way round it runs, with the one already in force marked.
+fn render_sort(f: &mut Frame, area: Rect, state: &SortState) {
+    let keys = state.scope.keys();
+    let width = area.width.saturating_sub(6).clamp(34, 50);
+    let height = (keys.len() as u16 + 4).min(area.height.saturating_sub(2));
+    let rect = popup(area, width, height);
+    overlay(f, rect);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(accent()))
+        .title(Span::styled(
+            format!(" Sort {} ", state.scope.label()),
+            Style::new().fg(accent()).bold(),
+        ))
+        .title(
+            Line::from(Span::styled(
+                " enter · r reverse · esc ",
+                Style::new().fg(subtle()),
+            ))
+            .right_aligned(),
+        )
+        .padding(Padding::symmetric(2, 1));
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    let hint_w = keys
+        .iter()
+        .map(|k| k.hint(state.reverse).chars().count())
+        .max()
+        .unwrap_or(0);
+    let label_w = (inner.width as usize).saturating_sub(4 + hint_w + 3);
+    let items: Vec<ListItem> = keys
+        .iter()
+        .map(|k| {
+            // A dot marks the ordering the list is already in; the arrow shows
+            // which way that one runs, which can differ from the pending flip.
+            let active = state.active.filter(|o| o.key == *k);
+            let mark = match active {
+                Some(o) => {
+                    let arrow = if o.reverse { "↑" } else { "↓" };
+                    Span::styled(format!("{arrow} "), Style::new().fg(green()).bold())
+                }
+                None => Span::raw("  "),
+            };
+            let label_txt = format!("{:<label_w$}", truncate(k.label(), label_w.max(4)));
+            let label_style = if active.is_some() {
+                Style::new().fg(text()).bold()
+            } else {
+                Style::new().fg(text())
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(format!("{}  ", k.glyph()), Style::new().fg(accent())),
+                mark,
+                Span::styled(label_txt, label_style),
+                Span::styled(
+                    format!(" {:>hint_w$}", k.hint(state.reverse)),
+                    Style::new().fg(subtle()),
+                ),
+            ]))
+        })
+        .collect();
+
+    let list = List::new(items)
+        .highlight_style(Style::new().bg(sel_bg()).bold())
+        .highlight_symbol("▍");
+    let mut ls = ListState::default();
+    ls.select(Some(state.sel.min(keys.len().saturating_sub(1))));
+    f.render_stateful_widget(list, inner, &mut ls);
+}
+
 // ---- helpers -------------------------------------------------------
 
 /// Clip a pane title to the pane's own width (less the border cells) so the
@@ -2376,9 +2722,7 @@ fn meta_rows<'a>(inner_w: usize, rows: Vec<RowSpec<'a>>) -> Vec<Line<'a>> {
 
     // Trim columns from the right until a reasonable title still fits.
     let mut active = n_cols;
-    while active > 0
-        && prefix_w + col_w[..active].iter().sum::<usize>() + 8 > inner_w
-    {
+    while active > 0 && prefix_w + col_w[..active].iter().sum::<usize>() + 8 > inner_w {
         active -= 1;
     }
     let meta_w: usize = col_w[..active].iter().sum();
@@ -2440,7 +2784,11 @@ fn info_row(label: &str, value: String, style: Style) -> Line<'static> {
 fn todo_detail_lines(t: &crate::model::Todo, today: NaiveDate) -> Vec<Line<'static>> {
     let mut lines = vec![
         Line::from(""),
-        info_row("priority", t.priority.label().to_string(), Style::new().fg(text())),
+        info_row(
+            "priority",
+            t.priority.label().to_string(),
+            Style::new().fg(text()),
+        ),
     ];
     if let Some(d) = t.due {
         lines.push(info_row(
@@ -2450,14 +2798,26 @@ fn todo_detail_lines(t: &crate::model::Todo, today: NaiveDate) -> Vec<Line<'stat
         ));
     }
     if !t.tags.is_empty() {
-        lines.push(info_row("tags", join_tags(&t.tags), Style::new().fg(blue())));
+        lines.push(info_row(
+            "tags",
+            join_tags(&t.tags),
+            Style::new().fg(blue()),
+        ));
     }
     let (sd, st) = t.subtask_progress();
     if st > 0 {
-        lines.push(info_row("subtasks", format!("{sd}/{st}"), Style::new().fg(text())));
+        lines.push(info_row(
+            "subtasks",
+            format!("{sd}/{st}"),
+            Style::new().fg(text()),
+        ));
     }
     if !t.note.trim().is_empty() {
-        lines.push(info_row("note", "yes  (n / N)".into(), Style::new().fg(subtle())));
+        lines.push(info_row(
+            "note",
+            "yes  (n / N)".into(),
+            Style::new().fg(subtle()),
+        ));
     }
     if !t.attachments.is_empty() {
         lines.push(info_row(
@@ -2474,13 +2834,25 @@ fn todo_detail_lines(t: &crate::model::Todo, today: NaiveDate) -> Vec<Line<'stat
 fn subtask_detail_lines(s: &crate::model::Subtask) -> Vec<Line<'static>> {
     let mut lines = vec![
         Line::from(""),
-        info_row("priority", s.priority.label().to_string(), Style::new().fg(text())),
+        info_row(
+            "priority",
+            s.priority.label().to_string(),
+            Style::new().fg(text()),
+        ),
     ];
     if !s.tags.is_empty() {
-        lines.push(info_row("tags", join_tags(&s.tags), Style::new().fg(blue())));
+        lines.push(info_row(
+            "tags",
+            join_tags(&s.tags),
+            Style::new().fg(blue()),
+        ));
     }
     if !s.note.trim().is_empty() {
-        lines.push(info_row("note", "yes  (n / N)".into(), Style::new().fg(subtle())));
+        lines.push(info_row(
+            "note",
+            "yes  (n / N)".into(),
+            Style::new().fg(subtle()),
+        ));
     }
     if !s.attachments.is_empty() {
         lines.push(info_row(
@@ -2508,6 +2880,62 @@ fn hint(text: &str) -> Paragraph<'static> {
         Line::from(Span::styled(format!("  {text}"), Style::new().fg(subtle()))),
     ])
     .wrap(Wrap { trim: false })
+}
+
+/// How far off a meeting is, in words. Unlike a deadline, a meeting in the past
+/// isn't "overdue" — it just already happened.
+fn meeting_rel(m: &Meeting, today: NaiveDate) -> String {
+    let when = match (m.date - today).num_days() {
+        0 => "today".to_string(),
+        1 => "tomorrow".to_string(),
+        -1 => "yesterday".to_string(),
+        d if d < 0 => format!("{}d ago", -d),
+        d => format!("in {d}d"),
+    };
+    match (&m.time, m.held) {
+        (Some(t), false) => format!("{when} · {t}"),
+        (_, true) => format!("{when} · held"),
+        (None, false) => when,
+    }
+}
+
+/// The `i` panel under a meeting row.
+fn meeting_detail_lines(m: &Meeting, today: NaiveDate) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::from(""),
+        info_row(
+            "when",
+            format!("{} · {}", m.date.format("%Y-%m-%d"), meeting_rel(m, today)),
+            Style::new().fg(text()),
+        ),
+    ];
+    lines.push(info_row(
+        "attendees",
+        if m.attendees.is_empty() {
+            "nobody yet  (e · +name)".to_string()
+        } else {
+            m.attendees.join(", ")
+        },
+        Style::new().fg(if m.attendees.is_empty() {
+            subtle()
+        } else {
+            text()
+        }),
+    ));
+    lines.push(info_row(
+        "notes",
+        if m.note.trim().is_empty() {
+            "none  (N)".to_string()
+        } else {
+            format!(
+                "{} lines  (l / N)",
+                m.note.lines().filter(|l| !l.trim().is_empty()).count()
+            )
+        },
+        Style::new().fg(subtle()),
+    ));
+    lines.push(Line::from(""));
+    lines
 }
 
 fn rel(date: NaiveDate, today: NaiveDate) -> String {
@@ -2561,6 +2989,65 @@ fn popup(area: Rect, width: u16, height: u16) -> Rect {
 fn overlay(f: &mut Frame, rect: Rect) {
     f.render_widget(Clear, rect);
     f.render_widget(Block::default().style(Style::new().bg(bg())), rect);
+}
+
+#[cfg(test)]
+mod header_tests {
+    use super::*;
+    use crate::app::App;
+    use crate::config::Config;
+    use crate::model::Store;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    /// The header row as text, at a given terminal width.
+    fn header(app: &mut App, width: u16) -> String {
+        app.clamp();
+        let mut terminal = Terminal::new(TestBackend::new(width, 6)).unwrap();
+        terminal.draw(|f| render(f, app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        (0..width)
+            .map(|x| buf[(x, 0)].symbol().chars().next().unwrap_or(' '))
+            .collect()
+    }
+
+    #[test]
+    fn the_name_stays_left_and_the_counts_go_right() {
+        let mut app = App::new(Store::sample(), Config::default(), None, None);
+        // One finished project and one overdue todo, so every segment shows.
+        for t in &mut app.store.projects[1].todos {
+            t.done = true;
+        }
+        for m in &mut app.store.projects[1].milestones {
+            m.done = true;
+        }
+        app.store.projects[0].todos[1].due =
+            Some(Local::now().date_naive() - chrono::Duration::days(3));
+
+        let row = header(&mut app, 100);
+        assert!(row.starts_with("  voido"), "{row:?}");
+        assert_eq!(
+            row.trim_end(),
+            row.trim_end_matches(' '),
+            "the counts keep a right-hand gap"
+        );
+        assert!(row.ends_with("1 overdue  "), "{row:?}");
+        assert!(
+            row.contains("2 projects  ·  1 done  ·  1 overdue"),
+            "{row:?}"
+        );
+
+        // Too narrow for all three: the least useful segments drop first, so the
+        // overdue count is the last one standing.
+        let row = header(&mut app, 30);
+        assert!(row.starts_with("  voido"), "{row:?}");
+        assert!(row.ends_with("1 overdue  "), "{row:?}");
+        assert!(!row.contains("projects"), "{row:?}");
+
+        // `m` (minimal) leaves the name alone.
+        app.minimal = true;
+        assert_eq!(header(&mut app, 100).trim_end(), "  voido");
+    }
 }
 
 #[cfg(test)]
@@ -2684,7 +3171,10 @@ mod tests {
         let lines = meta_rows(60, rows);
         let w0 = lines[0].width();
         assert!(w0 <= 60);
-        assert!(lines.iter().all(|l| l.width() == w0), "columns stay aligned");
+        assert!(
+            lines.iter().all(|l| l.width() == w0),
+            "columns stay aligned"
+        );
     }
 
     #[test]

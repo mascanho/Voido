@@ -43,7 +43,11 @@ pub fn extract_links(src: &str) -> Vec<(String, String)> {
         let url = url.trim().to_string();
         if !url.is_empty() && seen.insert(url.clone()) {
             let label = label.trim();
-            let label = if label.is_empty() { url.clone() } else { label.to_string() };
+            let label = if label.is_empty() {
+                url.clone()
+            } else {
+                label.to_string()
+            };
             out.push((label, url));
         }
     };
@@ -415,7 +419,10 @@ mod tests {
         assert_eq!(
             links,
             vec![
-                ("the docs".to_string(), "https://example.com/docs".to_string()),
+                (
+                    "the docs".to_string(),
+                    "https://example.com/docs".to_string()
+                ),
                 (
                     "https://bare.example.org".to_string(),
                     "https://bare.example.org".to_string()

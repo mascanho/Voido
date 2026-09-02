@@ -272,7 +272,10 @@ fn hhmm(iso: &str) -> String {
 }
 
 /// Turn the config value into `(lat, lon, display name)`.
-fn resolve(client: &reqwest::blocking::Client, location: &str) -> Result<(f64, f64, String), String> {
+fn resolve(
+    client: &reqwest::blocking::Client,
+    location: &str,
+) -> Result<(f64, f64, String), String> {
     let loc = location.trim();
     if loc.is_empty() || loc.eq_ignore_ascii_case("auto") {
         return ip_locate(client);
@@ -340,10 +343,22 @@ fn ip_locate(client: &reqwest::blocking::Client) -> Result<(f64, f64, String), S
         .map_err(|e| e.to_string())?;
 
     let loc = resp.loc.ok_or("IP lookup returned no coordinates")?;
-    let (a, b) = loc.split_once(',').ok_or("IP lookup coordinates malformed")?;
-    let lat: f64 = a.trim().parse().map_err(|_| "IP lookup latitude malformed")?;
-    let lon: f64 = b.trim().parse().map_err(|_| "IP lookup longitude malformed")?;
-    Ok((lat, lon, resp.city.unwrap_or_else(|| "current location".into())))
+    let (a, b) = loc
+        .split_once(',')
+        .ok_or("IP lookup coordinates malformed")?;
+    let lat: f64 = a
+        .trim()
+        .parse()
+        .map_err(|_| "IP lookup latitude malformed")?;
+    let lon: f64 = b
+        .trim()
+        .parse()
+        .map_err(|_| "IP lookup longitude malformed")?;
+    Ok((
+        lat,
+        lon,
+        resp.city.unwrap_or_else(|| "current location".into()),
+    ))
 }
 
 /// 8-point compass name for a bearing in degrees.

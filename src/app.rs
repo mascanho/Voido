@@ -1,6 +1,7 @@
 //! Application state and Vim-style key handling.
 
 use std::cell::RefCell;
+use std::cmp::Ordering;
 use std::hash::{Hash, Hasher};
 use std::sync::mpsc::{self, Receiver};
 use std::time::Instant;
@@ -15,7 +16,7 @@ use tui_textarea::{CursorMove, TextArea};
 
 use crate::config::{Config, StorageChoice};
 use crate::github::{GitHubClient, RepoInfo, RepoRef, SyncClient};
-use crate::model::{Attachment, Milestone, Note, Priority, Project, Store, Subtask, Todo};
+use crate::model::{Attachment, Meeting, Milestone, Note, Priority, Project, Store, Subtask, Todo};
 use crate::util::truncate;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,10 +77,17 @@ pub enum Tab {
     Todos,
     Notes,
     Schedule,
+    Meetings,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 4] = [Tab::Overview, Tab::Todos, Tab::Notes, Tab::Schedule];
+    pub const ALL: [Tab; 5] = [
+        Tab::Overview,
+        Tab::Todos,
+        Tab::Notes,
+        Tab::Schedule,
+        Tab::Meetings,
+    ];
 
     pub fn title(self) -> &'static str {
         match self {
@@ -87,6 +95,30 @@ impl Tab {
             Tab::Todos => "Todos",
             Tab::Notes => "Notes",
             Tab::Schedule => "Schedule",
+            Tab::Meetings => "Meetings",
+        }
+    }
+
+    /// Clipped title for the tab strip in a narrow pane.
+    fn short(self) -> &'static str {
+        match self {
+            Tab::Overview => "Ovw",
+            Tab::Todos => "Todo",
+            Tab::Notes => "Note",
+            Tab::Schedule => "Sched",
+            Tab::Meetings => "Meet",
+        }
+    }
+
+    /// The label the strip shows for this tab on a pane `width` wide. The full
+    /// titles don't fit the middle pane of the three-pane views, and a strip
+    /// that runs past the border would hide the last tab entirely.
+    pub fn strip_label(self, width: u16) -> &'static str {
+        let full: usize = Tab::ALL.iter().map(|t| t.title().chars().count() + 2).sum();
+        if full > (width as usize).saturating_sub(2) {
+            self.short()
+        } else {
+            self.title()
         }
     }
 }
@@ -157,6 +189,9 @@ pub enum InputAction {
     AddTag(TagTarget),
     AddMilestone,
     EditMilestone(usize),
+    AddMeeting,
+    EditMeeting(usize),
+    RescheduleMeeting(usize),
     RescheduleTodo(usize),
     RescheduleMilestone(usize),
     /// Write the whole store to a JSON file at this path.
@@ -190,6 +225,7 @@ pub enum ConfirmAction {
     DeleteSubtask(usize),
     DeleteNote(usize),
     DeleteMilestone(usize),
+    DeleteMeeting(usize),
     /// `q` — guard against an accidental quit.
     Quit,
     /// Replace the entire store with a dataset loaded from a file.
@@ -212,6 +248,8 @@ pub enum EditTarget {
     TodoNote(usize),
     /// The note attached to the current todo's subtask at this index.
     SubtaskNote(usize),
+    /// The agenda / minutes of the meeting at this index.
+    MeetingNote(usize),
 }
 
 /// The note `^f` blows up to fill the window.
@@ -223,6 +261,8 @@ pub enum FullNote {
     Subtask(usize),
     /// The Markdown body of the selected note in the Notes tab.
     Note,
+    /// The agenda / minutes of the selected meeting.
+    Meeting,
 }
 
 /// Which note the Todos-tab detail pane is rendering.
@@ -368,6 +408,8 @@ pub enum Mode {
     Links(LinksState),
     /// The main menu (`^k`) — a hub for the global actions.
     Menu(MenuState),
+    /// The `o` ordering menu for the list in focus.
+    Sort(SortState),
     /// Global fuzzy finder.
     Search(Box<SearchState>),
 }
@@ -414,6 +456,198 @@ pub struct MenuState {
     pub sel: usize,
 }
 
+/// Which list an ordering applies to. Each scope offers the orderings that make
+/// sense for what it holds, and remembers the last one applied to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortScope {
+    Projects,
+    Todos,
+    Subtasks,
+    Notes,
+    Meetings,
+}
+
+impl SortScope {
+    /// Index into `App::sorts`.
+    fn idx(self) -> usize {
+        match self {
+            SortScope::Projects => 0,
+            SortScope::Todos => 1,
+            SortScope::Subtasks => 2,
+            SortScope::Notes => 3,
+            SortScope::Meetings => 4,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SortScope::Projects => "projects",
+            SortScope::Todos => "todos",
+            SortScope::Subtasks => "subtasks",
+            SortScope::Notes => "notes",
+            SortScope::Meetings => "meetings",
+        }
+    }
+
+    /// The orderings this list offers, in menu order. The first is the default
+    /// the menu opens on, so it's the one that fits the list best.
+    pub fn keys(self) -> &'static [SortKey] {
+        match self {
+            SortScope::Projects => &[
+                SortKey::Name,
+                SortKey::Deadline,
+                SortKey::Open,
+                SortKey::Progress,
+                SortKey::Created,
+                SortKey::Tag,
+            ],
+            SortScope::Todos => &[
+                SortKey::Priority,
+                SortKey::Due,
+                SortKey::Name,
+                SortKey::Status,
+                SortKey::Progress,
+                SortKey::Tag,
+            ],
+            SortScope::Subtasks => &[
+                SortKey::Priority,
+                SortKey::Name,
+                SortKey::Status,
+                SortKey::Tag,
+            ],
+            SortScope::Notes => &[SortKey::Pinned, SortKey::Name, SortKey::Length],
+            SortScope::Meetings => &[
+                SortKey::Date,
+                SortKey::Name,
+                SortKey::Held,
+                SortKey::Attendees,
+            ],
+        }
+    }
+}
+
+/// One ordering offered by the `o` menu. Not every key applies to every scope —
+/// `SortScope::keys` decides which are on offer where.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortKey {
+    /// High → low.
+    Priority,
+    /// A todo's own due date.
+    Due,
+    /// When a meeting is (or was).
+    Date,
+    /// Title, case-folded.
+    Name,
+    /// Open before done.
+    Status,
+    /// How far along an item is (a todo by its subtasks, a project by its todos).
+    Progress,
+    /// When a project was created.
+    Created,
+    /// A project's soonest open milestone or todo due date.
+    Deadline,
+    /// How many todos a project still has open.
+    Open,
+    /// Pinned notes first.
+    Pinned,
+    /// How much body a note has.
+    Length,
+    /// Grouped by first tag.
+    Tag,
+    /// Meetings still to come before ones already held.
+    Held,
+    /// How many people are in a meeting.
+    Attendees,
+}
+
+impl SortKey {
+    pub fn label(self) -> &'static str {
+        match self {
+            SortKey::Priority => "Priority",
+            SortKey::Due => "Due date",
+            SortKey::Date => "Date",
+            SortKey::Name => "Name",
+            SortKey::Status => "Status",
+            SortKey::Progress => "Progress",
+            SortKey::Created => "Created",
+            SortKey::Deadline => "Next deadline",
+            SortKey::Open => "Open todos",
+            SortKey::Pinned => "Pinned",
+            SortKey::Length => "Note length",
+            SortKey::Tag => "Tag",
+            SortKey::Held => "Held",
+            SortKey::Attendees => "Attendees",
+        }
+    }
+
+    /// Nerd Font glyph for the menu row.
+    pub fn glyph(self) -> &'static str {
+        match self {
+            SortKey::Priority => "\u{f024}",
+            SortKey::Due => "\u{f073}",
+            SortKey::Date => "\u{f133}",
+            SortKey::Name => "\u{f15d}",
+            SortKey::Status => "\u{f046}",
+            SortKey::Progress => "\u{f200}",
+            SortKey::Created => "\u{f017}",
+            SortKey::Deadline => "\u{f252}",
+            SortKey::Open => "\u{f03a}",
+            SortKey::Pinned => "\u{f005}",
+            SortKey::Length => "\u{f036}",
+            SortKey::Tag => "\u{f02b}",
+            SortKey::Held => "\u{f274}",
+            SortKey::Attendees => "\u{f0c0}",
+        }
+    }
+
+    /// Which way round the ordering runs, spelled out for the menu row and the
+    /// status line — `r` in the menu flips it.
+    pub fn hint(self, reverse: bool) -> &'static str {
+        match (self, reverse) {
+            (SortKey::Priority, false) => "high → low",
+            (SortKey::Priority, true) => "low → high",
+            (SortKey::Due | SortKey::Deadline | SortKey::Date, false) => "soonest first",
+            (SortKey::Due | SortKey::Deadline | SortKey::Date, true) => "latest first",
+            (SortKey::Name | SortKey::Tag, false) => "A → Z",
+            (SortKey::Name | SortKey::Tag, true) => "Z → A",
+            (SortKey::Status, false) => "open first",
+            (SortKey::Status, true) => "done first",
+            (SortKey::Progress, false) => "most done first",
+            (SortKey::Progress, true) => "least done first",
+            (SortKey::Created, false) => "newest first",
+            (SortKey::Created, true) => "oldest first",
+            (SortKey::Open, false) => "most open first",
+            (SortKey::Open, true) => "fewest open first",
+            (SortKey::Pinned, false) => "pinned first",
+            (SortKey::Pinned, true) => "pinned last",
+            (SortKey::Length, false) => "longest first",
+            (SortKey::Length, true) => "shortest first",
+            (SortKey::Held, false) => "upcoming first",
+            (SortKey::Held, true) => "held first",
+            (SortKey::Attendees, false) => "most people first",
+            (SortKey::Attendees, true) => "fewest people first",
+        }
+    }
+}
+
+/// An ordering that was applied to a list, kept so the menu can reopen on it and
+/// mark it as the one in force.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SortOrder {
+    pub key: SortKey,
+    pub reverse: bool,
+}
+
+/// The `o` ordering menu.
+pub struct SortState {
+    pub scope: SortScope,
+    pub sel: usize,
+    /// Direction the highlighted ordering will be applied in; `r` flips it.
+    pub reverse: bool,
+    /// The ordering already in force for this scope, marked in the list.
+    pub active: Option<SortOrder>,
+}
+
 pub struct App {
     pub store: Store,
     pub focus: Focus,
@@ -423,6 +657,9 @@ pub struct App {
     pub subtask_idx: usize,
     pub note_idx: usize,
     pub note_scroll: u16,
+    pub meeting_idx: usize,
+    /// Scroll offset of the meeting agenda / minutes pane.
+    pub meeting_note_scroll: u16,
     pub note_expanded: bool,
     /// `^f`: the note on screen fills the whole window, panes and all.
     pub note_full: bool,
@@ -442,6 +679,7 @@ pub struct App {
     pub project_info: bool,
     pub todo_info: bool,
     pub subtask_info: bool,
+    pub meeting_info: bool,
     /// `m` toggles a stripped-back layout (no hint bar, minimal header).
     pub minimal: bool,
     /// `^l` toggles a bottom panel with two tables: app events and the log of
@@ -457,9 +695,9 @@ pub struct App {
     pub toast: Option<Toast>,
     pub timeline_idx: usize,
     pub deadline_filter: DeadlineFilter,
-    /// Which priority the last `o` press floated to the top. `o` cycles it
-    /// High -> Medium -> Low -> High and re-sorts the list in focus.
-    pub prio_sort: Option<Priority>,
+    /// The ordering last applied to each list, indexed by `SortScope`. Kept so
+    /// the `o` menu reopens on the order in force and can mark it.
+    pub sorts: [Option<SortOrder>; 5],
     pub mode: Mode,
     pub status: String,
     pub should_quit: bool,
@@ -552,6 +790,8 @@ impl App {
             subtask_idx: 0,
             note_idx: 0,
             note_scroll: 0,
+            meeting_idx: 0,
+            meeting_note_scroll: 0,
             todo_note_open: false,
             sub_note_open: false,
             sub_note_focus: false,
@@ -562,6 +802,7 @@ impl App {
             project_info: false,
             todo_info: false,
             subtask_info: false,
+            meeting_info: false,
             minimal: false,
             activity_open: false,
             logs: Vec::new(),
@@ -570,7 +811,7 @@ impl App {
             toast: None,
             timeline_idx: 0,
             deadline_filter: DeadlineFilter::All,
-            prio_sort: None,
+            sorts: [None; 5],
             mode: Mode::Normal,
             status: String::new(),
             should_quit: false,
@@ -900,12 +1141,7 @@ impl App {
     /// and the last attempt is stale (or there hasn't been one). Cheap to call
     /// every event-loop pass.
     pub fn maybe_refresh_weather(&mut self) {
-        let Some(loc) = self
-            .config
-            .weather
-            .clone()
-            .filter(|s| !s.trim().is_empty())
-        else {
+        let Some(loc) = self.config.weather.clone().filter(|s| !s.trim().is_empty()) else {
             return;
         };
         if self.weather_in_flight {
@@ -1088,6 +1324,15 @@ impl App {
         self.current_project()?.notes.get(self.note_idx)
     }
 
+    pub fn current_meeting(&self) -> Option<&Meeting> {
+        self.current_project()?.meetings.get(self.meeting_idx)
+    }
+
+    fn current_meeting_mut(&mut self) -> Option<&mut Meeting> {
+        let i = self.meeting_idx;
+        self.current_project_mut()?.meetings.get_mut(i)
+    }
+
     /// `n` at todo level toggled the selected todo's note into the detail pane
     /// (3rd pane), and it has a non-empty note to show.
     pub fn showing_todo_note(&self) -> bool {
@@ -1126,6 +1371,12 @@ impl App {
                 .filter(|n| !n.body.trim().is_empty())
                 .map(|_| FullNote::Note);
         }
+        if self.tab == Tab::Meetings {
+            return self
+                .current_meeting()
+                .filter(|m| !m.note.trim().is_empty())
+                .map(|_| FullNote::Meeting);
+        }
         if self.showing_sub_note() {
             return Some(FullNote::Subtask(self.subtask_idx));
         }
@@ -1163,6 +1414,14 @@ impl App {
                     self.sub_note_scroll,
                 ))
             }
+            FullNote::Meeting => {
+                let m = self.current_meeting()?;
+                Some((
+                    format!(" Meeting · {} · {} ", m.title, m.when()),
+                    m.note.as_str(),
+                    self.meeting_note_scroll,
+                ))
+            }
         }
     }
 
@@ -1192,6 +1451,7 @@ impl App {
             Some(FullNote::Note) => &mut self.note_scroll,
             Some(FullNote::Todo) => &mut self.todo_note_scroll,
             Some(FullNote::Subtask(_)) => &mut self.sub_note_scroll,
+            Some(FullNote::Meeting) => &mut self.meeting_note_scroll,
             None => return,
         };
         *target = if delta < 0 {
@@ -1268,6 +1528,7 @@ impl App {
         match self.tab {
             Tab::Todos => self.current_todo().is_some(),
             Tab::Notes => self.current_note().is_some(),
+            Tab::Meetings => self.current_meeting().is_some(),
             _ => false,
         }
     }
@@ -1416,6 +1677,18 @@ impl App {
         self.sub_note_scroll = self.sub_note_scroll.min(sub_note_lines.saturating_add(4));
         let tl = self.timeline().len();
         self.timeline_idx = self.timeline_idx.min(tl.saturating_sub(1));
+        let meetings = self
+            .current_project()
+            .map(|p| p.meetings.len())
+            .unwrap_or(0);
+        self.meeting_idx = self.meeting_idx.min(meetings.saturating_sub(1));
+        let meeting_note_lines = self
+            .current_meeting()
+            .map(|m| m.note.lines().count() as u16 + 8)
+            .unwrap_or(0);
+        self.meeting_note_scroll = self
+            .meeting_note_scroll
+            .min(meeting_note_lines.saturating_sub(1));
 
         if self.focus == Focus::Detail && !self.detail_available() {
             self.focus = Focus::Content;
@@ -1443,6 +1716,7 @@ impl App {
             Mode::Tags(_) => self.handle_tags(key),
             Mode::Links(_) => self.handle_links(key),
             Mode::Menu(_) => self.handle_menu(key),
+            Mode::Sort(_) => self.handle_sort(key),
             Mode::Search(_) => self.handle_search(key),
             Mode::Help | Mode::GitHub | Mode::Weather | Mode::Notice(..) => {
                 self.mode = Mode::Normal
@@ -1557,6 +1831,16 @@ impl App {
                         self.timeline_idx = i;
                     }
                 }
+                Tab::Meetings => {
+                    let len = self
+                        .current_project()
+                        .map(|p| p.meetings.len())
+                        .unwrap_or(0);
+                    if let Some(i) = row_at(r.content, pos.y, len) {
+                        self.meeting_idx = i;
+                        self.meeting_note_scroll = 0;
+                    }
+                }
                 Tab::Overview => {}
             }
             return true;
@@ -1600,15 +1884,17 @@ impl App {
                 KeyCode::Char('u') if self.focus == Focus::Detail && self.tab == Tab::Notes => {
                     self.note_scroll = self.note_scroll.saturating_sub(10);
                 }
+                KeyCode::Char('d') if self.focus == Focus::Detail && self.tab == Tab::Meetings => {
+                    self.scroll_meeting_note(10);
+                }
+                KeyCode::Char('u') if self.focus == Focus::Detail && self.tab == Tab::Meetings => {
+                    self.scroll_meeting_note(-10);
+                }
                 // scroll the note(s) shown under the subtask list
-                KeyCode::Char('d')
-                    if self.showing_todo_note() || self.showing_sub_note() =>
-                {
+                KeyCode::Char('d') if self.showing_todo_note() || self.showing_sub_note() => {
                     self.scroll_detail_note(6);
                 }
-                KeyCode::Char('u')
-                    if self.showing_todo_note() || self.showing_sub_note() =>
-                {
+                KeyCode::Char('u') if self.showing_todo_note() || self.showing_sub_note() => {
                     self.scroll_detail_note(-6);
                 }
                 _ => {}
@@ -1623,7 +1909,7 @@ impl App {
         if self.note_full
             && !matches!(
                 key.code,
-                KeyCode::Char('q' | '?' | '/' | 'L' | 'm' | '1' | '2' | '3' | '4')
+                KeyCode::Char('q' | '?' | '/' | 'L' | 'm' | '1' | '2' | '3' | '4' | '5')
                     | KeyCode::Tab
                     | KeyCode::BackTab
             )
@@ -1657,13 +1943,17 @@ impl App {
             KeyCode::Char('2') => self.goto_tab(Tab::Todos),
             KeyCode::Char('3') => self.goto_tab(Tab::Notes),
             KeyCode::Char('4') => self.goto_tab(Tab::Schedule),
+            KeyCode::Char('5') => self.goto_tab(Tab::Meetings),
             // Switch project from anywhere, without leaving the current view.
             KeyCode::Char('w') => self.select_project(-1),
             KeyCode::Char('s') => self.select_project(1),
             KeyCode::Esc => {
                 if self.sub_note_focus {
                     self.sub_note_focus = false;
-                } else if self.tab == Tab::Notes && self.focus == Focus::Detail && self.note_expanded {
+                } else if self.tab == Tab::Notes
+                    && self.focus == Focus::Detail
+                    && self.note_expanded
+                {
                     self.note_expanded = false;
                 } else {
                     self.focus = match self.focus {
@@ -1695,12 +1985,14 @@ impl App {
                     Tab::Todos => self.handle_todos_key(key),
                     Tab::Notes => self.handle_notes_key(key),
                     Tab::Schedule => self.handle_timeline_key(key),
+                    Tab::Meetings => self.handle_meetings_key(key),
                 },
                 Focus::Detail if self.sub_note_focus && self.showing_sub_note() => {
                     self.handle_sub_note_key(key)
                 }
                 Focus::Detail => match self.tab {
                     Tab::Notes => self.handle_note_body_key(key),
+                    Tab::Meetings => self.handle_meeting_note_key(key),
                     _ => self.handle_subtasks_key(key),
                 },
             },
@@ -1734,7 +2026,8 @@ impl App {
                     });
                 }
             }
-            KeyCode::Char('o') => self.show_github(),
+            KeyCode::Char('o') => self.open_sort(SortScope::Projects),
+            KeyCode::Char('R') => self.show_github(),
             KeyCode::Char('t') => self.open_tags(),
             KeyCode::Char('i') => self.project_info = !self.project_info,
             KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => {
@@ -1818,7 +2111,7 @@ impl App {
             }
             KeyCode::Char('J') => self.reorder_todo(1),
             KeyCode::Char('K') => self.reorder_todo(-1),
-            KeyCode::Char('o') => self.sort_todos_by_priority(),
+            KeyCode::Char('o') => self.open_sort(SortScope::Todos),
             KeyCode::Char('N') => self.begin_edit_todo_note(),
             KeyCode::Char('A') => self.open_attachments(),
             KeyCode::Char('t') => self.open_tags(),
@@ -1827,62 +2120,160 @@ impl App {
         }
     }
 
-    /// Advance the priority-sort cycle (High -> Medium -> Low -> High) and return
-    /// the priority that should now sit on top.
-    fn next_prio_sort(&mut self) -> Priority {
-        let next = match self.prio_sort {
-            None | Some(Priority::Low) => Priority::High,
-            Some(Priority::High) => Priority::Medium,
-            Some(Priority::Medium) => Priority::Low,
+    /// `o` — open the ordering menu for the list in focus, sitting on whatever
+    /// order that list is already in.
+    fn open_sort(&mut self, scope: SortScope) {
+        let active = self.sorts[scope.idx()];
+        let sel = active
+            .and_then(|o| scope.keys().iter().position(|k| *k == o.key))
+            .unwrap_or(0);
+        let reverse = active.map(|o| o.reverse).unwrap_or(false);
+        self.mode = Mode::Sort(SortState {
+            scope,
+            sel,
+            reverse,
+            active,
+        });
+    }
+
+    fn handle_sort(&mut self, key: KeyEvent) {
+        let Mode::Sort(state) = &mut self.mode else {
+            return;
         };
-        self.prio_sort = Some(next);
-        next
+        let len = state.scope.keys().len();
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('o') => self.mode = Mode::Normal,
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.should_quit = true
+            }
+            KeyCode::Char('j') | KeyCode::Down => state.sel = step(state.sel, 1, len),
+            KeyCode::Char('k') | KeyCode::Up => state.sel = step(state.sel, -1, len),
+            KeyCode::Char('g') | KeyCode::Home => state.sel = 0,
+            KeyCode::Char('G') | KeyCode::End => state.sel = len - 1,
+            // Flip the direction the highlighted ordering runs in.
+            KeyCode::Char('r') | KeyCode::Tab => state.reverse = !state.reverse,
+            KeyCode::Enter | KeyCode::Char('l') | KeyCode::Char(' ') => {
+                let (scope, sort_key, reverse) =
+                    (state.scope, state.scope.keys()[state.sel], state.reverse);
+                self.mode = Mode::Normal;
+                self.apply_sort(scope, sort_key, reverse);
+            }
+            _ => {}
+        }
     }
 
-    /// `o` in the Todos pane: stable-sort the current project's todos so `top`
-    /// sits first, the rest following in High -> Low order. Repeated presses
-    /// cycle which priority floats up. Keeps the selection on the same todo.
-    fn sort_todos_by_priority(&mut self) {
-        let top = self.next_prio_sort();
-        let selected_title = self.current_todo().map(|t| t.title.clone());
-        if let Some(p) = self.current_project_mut() {
-            if p.todos.len() < 2 {
-                return;
+    /// Reorder the list `scope` names, remember the choice, and keep the
+    /// selection on the row the user was sitting on. Sorts are stable, so items
+    /// that tie hold the hand-ordered positions `J`/`K` gave them.
+    fn apply_sort(&mut self, scope: SortScope, key: SortKey, reverse: bool) {
+        let sorted = match scope {
+            SortScope::Projects => {
+                let sel = self.current_project().map(|p| p.name.clone());
+                let long_enough = self.store.projects.len() > 1;
+                if long_enough {
+                    self.store
+                        .projects
+                        .sort_by(|a, b| cmp_project(a, b, key, reverse));
+                    if let Some(name) = sel
+                        && let Some(i) = self.store.projects.iter().position(|p| p.name == name)
+                    {
+                        self.project_idx = i;
+                    }
+                }
+                long_enough
             }
-            p.todos.sort_by_key(|t| priority_sort_key(t.priority, top));
-            self.dirty = true;
-        }
-        if let (Some(title), Some(p)) = (selected_title, self.current_project())
-            && let Some(i) = p.todos.iter().position(|t| t.title == title)
-        {
-            self.todo_idx = i;
-        }
-        self.subtask_idx = 0;
-        self.status = format!("{} priority on top", top.label());
-    }
-
-    /// `o` in the Subtasks pane: same cycle, applied to the current todo's
-    /// subtasks. Keeps the selection on the same subtask.
-    fn sort_subtasks_by_priority(&mut self) {
-        let top = self.next_prio_sort();
-        let selected_title = self
-            .current_todo()
-            .and_then(|t| t.subtasks.get(self.subtask_idx))
-            .map(|s| s.title.clone());
-        if let Some(t) = self.current_todo_mut() {
-            if t.subtasks.len() < 2 {
-                return;
+            SortScope::Todos => {
+                let sel = self.current_todo().map(|t| t.title.clone());
+                let mut long_enough = false;
+                if let Some(p) = self.current_project_mut()
+                    && p.todos.len() > 1
+                {
+                    p.todos.sort_by(|a, b| cmp_todo(a, b, key, reverse));
+                    long_enough = true;
+                }
+                if long_enough {
+                    if let Some(title) = sel
+                        && let Some(p) = self.current_project()
+                        && let Some(i) = p.todos.iter().position(|t| t.title == title)
+                    {
+                        self.todo_idx = i;
+                    }
+                    self.subtask_idx = 0;
+                }
+                long_enough
             }
-            t.subtasks
-                .sort_by_key(|s| priority_sort_key(s.priority, top));
+            SortScope::Subtasks => {
+                let sel = self
+                    .current_todo()
+                    .and_then(|t| t.subtasks.get(self.subtask_idx))
+                    .map(|s| s.title.clone());
+                let mut long_enough = false;
+                if let Some(t) = self.current_todo_mut()
+                    && t.subtasks.len() > 1
+                {
+                    t.subtasks.sort_by(|a, b| cmp_subtask(a, b, key, reverse));
+                    long_enough = true;
+                }
+                if long_enough
+                    && let Some(title) = sel
+                    && let Some(t) = self.current_todo()
+                    && let Some(i) = t.subtasks.iter().position(|s| s.title == title)
+                {
+                    self.subtask_idx = i;
+                }
+                long_enough
+            }
+            SortScope::Meetings => {
+                let sel = self.current_meeting().map(|m| m.title.clone());
+                let mut long_enough = false;
+                if let Some(p) = self.current_project_mut()
+                    && p.meetings.len() > 1
+                {
+                    p.meetings.sort_by(|a, b| cmp_meeting(a, b, key, reverse));
+                    long_enough = true;
+                }
+                if long_enough
+                    && let Some(title) = sel
+                    && let Some(p) = self.current_project()
+                    && let Some(i) = p.meetings.iter().position(|m| m.title == title)
+                {
+                    self.meeting_idx = i;
+                    self.meeting_note_scroll = 0;
+                }
+                long_enough
+            }
+            SortScope::Notes => {
+                let sel = self.current_note().map(|n| n.text.clone());
+                let mut long_enough = false;
+                if let Some(p) = self.current_project_mut()
+                    && p.notes.len() > 1
+                {
+                    p.notes.sort_by(|a, b| cmp_note(a, b, key, reverse));
+                    long_enough = true;
+                }
+                if long_enough
+                    && let Some(text) = sel
+                    && let Some(p) = self.current_project()
+                    && let Some(i) = p.notes.iter().position(|n| n.text == text)
+                {
+                    self.note_idx = i;
+                    self.note_scroll = 0;
+                }
+                long_enough
+            }
+        };
+        self.sorts[scope.idx()] = Some(SortOrder { key, reverse });
+        if sorted {
             self.dirty = true;
+            self.status = format!(
+                "{} sorted by {} — {}",
+                scope.label(),
+                key.label().to_lowercase(),
+                key.hint(reverse)
+            );
+        } else {
+            self.status = format!("nothing to sort — fewer than two {}", scope.label());
         }
-        if let (Some(title), Some(t)) = (selected_title, self.current_todo())
-            && let Some(i) = t.subtasks.iter().position(|s| s.title == title)
-        {
-            self.subtask_idx = i;
-        }
-        self.status = format!("{} priority on top", top.label());
     }
 
     fn reorder_todo(&mut self, delta: i32) {
@@ -1943,8 +2334,10 @@ impl App {
                     s.done = !s.done;
                     let (title, done) = (s.title.clone(), s.done);
                     self.dirty = true;
-                    self.status =
-                        format!("subtask {} “{title}”", if done { "done" } else { "reopened" });
+                    self.status = format!(
+                        "subtask {} “{title}”",
+                        if done { "done" } else { "reopened" }
+                    );
                 }
                 self.sync_parent_done();
             }
@@ -1972,7 +2365,7 @@ impl App {
             }
             KeyCode::Char('J') => self.reorder_subtask(1),
             KeyCode::Char('K') => self.reorder_subtask(-1),
-            KeyCode::Char('o') => self.sort_subtasks_by_priority(),
+            KeyCode::Char('o') => self.open_sort(SortScope::Subtasks),
             KeyCode::Char('N') => self.begin_edit_subtask_note(),
             KeyCode::Char('A') => self.open_subtask_attachments(),
             KeyCode::Char('t') => self.open_tags(),
@@ -2075,7 +2468,12 @@ impl App {
                     n.pinned = !n.pinned;
                     let pinned = n.pinned;
                     self.dirty = true;
-                    self.status = if pinned { "note pinned" } else { "note unpinned" }.into();
+                    self.status = if pinned {
+                        "note pinned"
+                    } else {
+                        "note unpinned"
+                    }
+                    .into();
                 }
             }
             KeyCode::Char('d') => {
@@ -2093,6 +2491,7 @@ impl App {
             }
             KeyCode::Char('J') => self.reorder_note(1),
             KeyCode::Char('K') => self.reorder_note(-1),
+            KeyCode::Char('o') => self.open_sort(SortScope::Notes),
             _ => {}
         }
     }
@@ -2113,6 +2512,134 @@ impl App {
         self.note_idx = j;
         self.dirty = true;
         self.status = "moved note".into();
+    }
+
+    // ---- meetings tab ------------------------------------------
+
+    fn handle_meetings_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => self.move_sel(1),
+            KeyCode::Char('k') | KeyCode::Up => self.move_sel(-1),
+            KeyCode::Char('h') | KeyCode::Left => self.focus = Focus::Projects,
+            KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => {
+                if self.current_meeting().is_some() {
+                    self.meeting_note_scroll = 0;
+                    self.focus = Focus::Detail;
+                }
+            }
+            KeyCode::Char('a') => {
+                if self.current_project().is_some() {
+                    self.begin_input(MEETING_PROMPT, String::new(), InputAction::AddMeeting);
+                } else {
+                    self.status = "create a project first".into();
+                }
+            }
+            KeyCode::Char('e') => {
+                if let Some(m) = self.current_meeting() {
+                    let pre = meeting_edit_string(m);
+                    let i = self.meeting_idx;
+                    self.begin_input("Edit meeting", pre, InputAction::EditMeeting(i));
+                }
+            }
+            KeyCode::Char('r') => {
+                if let Some(m) = self.current_meeting() {
+                    let pre = match &m.time {
+                        Some(t) => format!("@{} {t}", m.date.format("%Y-%m-%d")),
+                        None => format!("@{}", m.date.format("%Y-%m-%d")),
+                    };
+                    let i = self.meeting_idx;
+                    self.begin_input(
+                        "Reschedule meeting   (@YYYY-MM-DD · 14:30)",
+                        pre,
+                        InputAction::RescheduleMeeting(i),
+                    );
+                }
+            }
+            KeyCode::Char('x') | KeyCode::Char(' ') => {
+                if let Some(m) = self.current_meeting_mut() {
+                    m.held = !m.held;
+                    let (title, held) = (m.title.clone(), m.held);
+                    self.dirty = true;
+                    self.status = format!(
+                        "“{title}” {}",
+                        if held { "held" } else { "back on the calendar" }
+                    );
+                }
+            }
+            KeyCode::Char('d') => {
+                if let Some(m) = self.current_meeting() {
+                    let prompt = format!("Delete meeting \"{}\"?", m.title);
+                    let i = self.meeting_idx;
+                    self.mode = Mode::Confirm(ConfirmState {
+                        prompt,
+                        action: ConfirmAction::DeleteMeeting(i),
+                    });
+                }
+            }
+            KeyCode::Char('J') => self.reorder_meeting(1),
+            KeyCode::Char('K') => self.reorder_meeting(-1),
+            KeyCode::Char('o') => self.open_sort(SortScope::Meetings),
+            KeyCode::Char('N') => self.begin_edit_meeting_note(),
+            KeyCode::Char('i') => self.meeting_info = !self.meeting_info,
+            _ => {}
+        }
+    }
+
+    fn reorder_meeting(&mut self, delta: i32) {
+        let i = self.meeting_idx;
+        let len = self
+            .current_project()
+            .map(|p| p.meetings.len())
+            .unwrap_or(0);
+        if len < 2 {
+            return;
+        }
+        let j = (i as i32 + delta).clamp(0, len as i32 - 1) as usize;
+        if i == j {
+            return;
+        }
+        if let Some(p) = self.current_project_mut() {
+            p.meetings.swap(i, j);
+        }
+        self.meeting_idx = j;
+        self.dirty = true;
+        self.status = "moved meeting".into();
+    }
+
+    /// Keys while focus sits in the agenda / minutes pane beside the meeting list.
+    fn handle_meeting_note_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => self.scroll_meeting_note(1),
+            KeyCode::Char('k') | KeyCode::Up => self.scroll_meeting_note(-1),
+            KeyCode::PageDown => self.scroll_meeting_note(10),
+            KeyCode::PageUp => self.scroll_meeting_note(-10),
+            KeyCode::Char('h') | KeyCode::Left => self.focus = Focus::Content,
+            KeyCode::Char('e') | KeyCode::Char('N') | KeyCode::Enter => {
+                self.begin_edit_meeting_note()
+            }
+            _ => {}
+        }
+    }
+
+    fn scroll_meeting_note(&mut self, delta: i32) {
+        self.meeting_note_scroll = if delta < 0 {
+            self.meeting_note_scroll
+                .saturating_sub((-delta).min(i32::from(u16::MAX)) as u16)
+        } else {
+            self.meeting_note_scroll
+                .saturating_add(delta.min(i32::from(u16::MAX)) as u16)
+        };
+    }
+
+    /// Open the Markdown editor on the selected meeting's agenda / minutes.
+    fn begin_edit_meeting_note(&mut self) {
+        let Some(m) = self.current_meeting() else {
+            self.status = "pick a meeting first".into();
+            return;
+        };
+        let note = m.note.clone();
+        self.begin_edit(EditTarget::MeetingNote(self.meeting_idx), &note);
+        self.status = "editing meeting notes — esc / ^s to save".into();
     }
 
     // ---- note body pane (rendered markdown, beside a note) ------
@@ -2222,6 +2749,17 @@ impl App {
                     self.dirty = true;
                     self.status = "todo note saved".into();
                 }
+            }
+            EditTarget::MeetingNote(i) => {
+                if let Some(m) = self
+                    .current_project_mut()
+                    .and_then(|p| p.meetings.get_mut(i))
+                {
+                    m.note = body;
+                    self.dirty = true;
+                    self.status = "meeting notes saved".into();
+                }
+                self.meeting_note_scroll = 0;
             }
             EditTarget::SubtaskNote(i) => {
                 let ti = self.todo_idx;
@@ -2396,9 +2934,11 @@ impl App {
         match t {
             TagTarget::Project => Some(&p.tags),
             TagTarget::Todo(i) => p.todos.get(i).map(|t| &t.tags),
-            TagTarget::Subtask { todo, sub } => {
-                p.todos.get(todo).and_then(|t| t.subtasks.get(sub)).map(|s| &s.tags)
-            }
+            TagTarget::Subtask { todo, sub } => p
+                .todos
+                .get(todo)
+                .and_then(|t| t.subtasks.get(sub))
+                .map(|s| &s.tags),
         }
     }
 
@@ -2464,9 +3004,8 @@ impl App {
                 .current_todo()
                 .and_then(|t| t.subtasks.get(self.subtask_idx))
                 .map(|s| s.note.as_str()),
-            Tab::Todos if self.showing_todo_note() => {
-                self.current_todo().map(|t| t.note.as_str())
-            }
+            Tab::Todos if self.showing_todo_note() => self.current_todo().map(|t| t.note.as_str()),
+            Tab::Meetings => self.current_meeting().map(|m| m.note.as_str()),
             _ => None,
         }
     }
@@ -2475,7 +3014,8 @@ impl App {
     /// copied.
     fn open_links(&mut self) {
         let Some(md) = self.current_markdown() else {
-            self.status = "no note on screen — press n on a todo/subtask, or open the Notes tab".into();
+            self.status =
+                "no note on screen — press n on a todo/subtask, or open the Notes tab".into();
             return;
         };
         let items = crate::md::extract_links(md);
@@ -3325,6 +3865,51 @@ impl App {
                     self.status = "milestone updated".into();
                 }
             }
+            InputAction::AddMeeting => {
+                let today = Local::now().date_naive();
+                match parse_meeting_input(&value, today) {
+                    Some((title, date, time, attendees)) => {
+                        if let Some(p) = self.current_project_mut() {
+                            let mut m = Meeting::new(title, date);
+                            m.time = time;
+                            m.attendees = attendees;
+                            p.meetings.push(m);
+                            self.meeting_idx = p.meetings.len() - 1;
+                        }
+                        self.dirty = true;
+                        self.status = "meeting added".into();
+                    }
+                    None => self.status = "nothing added".into(),
+                }
+            }
+            InputAction::EditMeeting(i) => {
+                let today = Local::now().date_naive();
+                if let Some((title, date, time, attendees)) = parse_meeting_input(&value, today)
+                    && let Some(m) = self
+                        .current_project_mut()
+                        .and_then(|p| p.meetings.get_mut(i))
+                {
+                    m.title = title;
+                    m.date = date;
+                    m.time = time;
+                    m.attendees = attendees;
+                    self.dirty = true;
+                    self.status = "meeting updated".into();
+                }
+            }
+            InputAction::RescheduleMeeting(i) => {
+                let today = Local::now().date_naive();
+                let (date, time) = parse_meeting_when(&value, today);
+                if let Some(m) = self
+                    .current_project_mut()
+                    .and_then(|p| p.meetings.get_mut(i))
+                {
+                    m.date = date;
+                    m.time = time;
+                    self.dirty = true;
+                    self.status = format!("moved to {}", date.format("%Y-%m-%d"));
+                }
+            }
             InputAction::RescheduleTodo(i) => {
                 let today = Local::now().date_naive();
                 if let Some((_, date)) = parse_milestone_input(&value, today)
@@ -3489,6 +4074,17 @@ impl App {
                 self.dirty = true;
                 self.status = "milestone deleted".into();
             }
+            ConfirmAction::DeleteMeeting(i) => {
+                if let Some(p) = self.current_project_mut()
+                    && i < p.meetings.len()
+                {
+                    p.meetings.remove(i);
+                }
+                self.meeting_idx = self.meeting_idx.saturating_sub(1);
+                self.meeting_note_scroll = 0;
+                self.dirty = true;
+                self.status = "meeting deleted".into();
+            }
             ConfirmAction::Quit => self.should_quit = true,
             ConfirmAction::ImportSettings(config) => self.adopt_settings(*config),
             ConfirmAction::ImportData(store) => {
@@ -3536,6 +4132,8 @@ impl App {
         self.todo_note_scroll = 0;
         self.sub_note_scroll = 0;
         self.timeline_idx = 0;
+        self.meeting_idx = 0;
+        self.meeting_note_scroll = 0;
     }
 
     fn cycle_tab(&mut self, forward: bool) {
@@ -3627,6 +4225,14 @@ impl App {
                     let len = self.timeline().len();
                     self.timeline_idx = step(self.timeline_idx, delta, len);
                 }
+                Tab::Meetings => {
+                    let len = self
+                        .current_project()
+                        .map(|p| p.meetings.len())
+                        .unwrap_or(0);
+                    self.meeting_idx = step(self.meeting_idx, delta, len);
+                    self.meeting_note_scroll = 0;
+                }
             },
             Focus::Detail => match self.tab {
                 Tab::Notes => {
@@ -3638,6 +4244,7 @@ impl App {
                             .saturating_add(delta.min(i32::from(u16::MAX)) as u16)
                     };
                 }
+                Tab::Meetings => self.scroll_meeting_note(delta),
                 _ => {
                     let len = self.current_todo().map(|t| t.subtasks.len()).unwrap_or(0);
                     self.subtask_idx = step(self.subtask_idx, delta, len);
@@ -3654,7 +4261,7 @@ impl App {
 fn tab_at_x(content: Rect, x: u16) -> Option<Tab> {
     let mut cx = content.x + 1;
     for t in Tab::ALL {
-        let w = t.title().chars().count() as u16 + 2;
+        let w = t.strip_label(content.width).chars().count() as u16 + 2;
         if x >= cx && x < cx + w {
             return Some(t);
         }
@@ -3720,11 +4327,127 @@ fn fuzzy_score(needle: &str, haystack: &str) -> Option<i32> {
     Some(score)
 }
 
-/// Sort key that floats `top` to the front, with the other two priorities
-/// following in High -> Medium -> Low order. `slice::sort_by_key` is stable, so
-/// items of equal priority keep their relative order.
-fn priority_sort_key(p: Priority, top: Priority) -> u8 {
-    if p == top { 0 } else { p.rank() + 1 }
+/// Compare two values in the requested direction.
+fn cmp_val<T: Ord>(a: T, b: T, reverse: bool) -> Ordering {
+    if reverse { b.cmp(&a) } else { a.cmp(&b) }
+}
+
+/// Compare two values that an item may not have (a due date, a tag). Present
+/// values order as asked; anything missing sits at the bottom either way, so
+/// reversing doesn't float the blanks to the top.
+fn cmp_opt<T: Ord>(a: Option<T>, b: Option<T>, reverse: bool) -> Ordering {
+    match (a, b) {
+        (Some(x), Some(y)) => cmp_val(x, y, reverse),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+/// Case-folded title, so `Name` orders the way a reader reads.
+fn name_key(s: &str) -> String {
+    s.trim().to_lowercase()
+}
+
+/// The tag `Tag` groups an item under — its first, since that's the one the
+/// lists show first.
+fn tag_key(tags: &[String]) -> Option<String> {
+    tags.first().map(|t| t.to_lowercase())
+}
+
+/// How far along a todo is, 0-100: its subtask completion, or its own done flag
+/// when it has no subtasks.
+fn todo_progress(t: &Todo) -> u32 {
+    let (done, total) = t.subtask_progress();
+    if total == 0 {
+        if t.done { 100 } else { 0 }
+    } else {
+        done as u32 * 100 / total as u32
+    }
+}
+
+/// How far along a project is, 0-100: the mean progress of its todos.
+fn project_progress(p: &Project) -> u32 {
+    if p.todos.is_empty() {
+        return 0;
+    }
+    p.todos.iter().map(todo_progress).sum::<u32>() / p.todos.len() as u32
+}
+
+/// The soonest date a project owes something: its next open milestone, or the
+/// earliest due date among its open todos.
+fn project_deadline(p: &Project) -> Option<NaiveDate> {
+    p.milestones
+        .iter()
+        .filter(|m| !m.done)
+        .map(|m| m.date)
+        .chain(p.todos.iter().filter(|t| !t.done).filter_map(|t| t.due))
+        .min()
+}
+
+/// `Progress`, `Created`, `Open`, `Length` and `Pinned` read best largest-first,
+/// so their natural direction is the reverse of an ascending compare.
+fn cmp_desc<T: Ord>(a: T, b: T, reverse: bool) -> Ordering {
+    cmp_val(a, b, !reverse)
+}
+
+fn cmp_project(a: &Project, b: &Project, key: SortKey, reverse: bool) -> Ordering {
+    match key {
+        SortKey::Name => cmp_val(name_key(&a.name), name_key(&b.name), reverse),
+        SortKey::Deadline => cmp_opt(project_deadline(a), project_deadline(b), reverse),
+        SortKey::Open => cmp_desc(a.open_todos(), b.open_todos(), reverse),
+        SortKey::Progress => cmp_desc(project_progress(a), project_progress(b), reverse),
+        SortKey::Created => cmp_desc(a.created, b.created, reverse),
+        SortKey::Tag => cmp_opt(tag_key(&a.tags), tag_key(&b.tags), reverse),
+        _ => Ordering::Equal,
+    }
+}
+
+fn cmp_todo(a: &Todo, b: &Todo, key: SortKey, reverse: bool) -> Ordering {
+    match key {
+        SortKey::Priority => cmp_val(a.priority.rank(), b.priority.rank(), reverse),
+        SortKey::Due => cmp_opt(a.due, b.due, reverse),
+        SortKey::Name => cmp_val(name_key(&a.title), name_key(&b.title), reverse),
+        SortKey::Status => cmp_val(a.done, b.done, reverse),
+        SortKey::Progress => cmp_desc(todo_progress(a), todo_progress(b), reverse),
+        SortKey::Tag => cmp_opt(tag_key(&a.tags), tag_key(&b.tags), reverse),
+        _ => Ordering::Equal,
+    }
+}
+
+fn cmp_subtask(a: &Subtask, b: &Subtask, key: SortKey, reverse: bool) -> Ordering {
+    match key {
+        SortKey::Priority => cmp_val(a.priority.rank(), b.priority.rank(), reverse),
+        SortKey::Name => cmp_val(name_key(&a.title), name_key(&b.title), reverse),
+        SortKey::Status => cmp_val(a.done, b.done, reverse),
+        SortKey::Tag => cmp_opt(tag_key(&a.tags), tag_key(&b.tags), reverse),
+        _ => Ordering::Equal,
+    }
+}
+
+fn cmp_meeting(a: &Meeting, b: &Meeting, key: SortKey, reverse: bool) -> Ordering {
+    match key {
+        // Same day, earlier slot first — an unscheduled time sorts after the
+        // timed meetings on that day.
+        SortKey::Date => cmp_val(
+            (a.date, a.time.is_none(), a.time.clone()),
+            (b.date, b.time.is_none(), b.time.clone()),
+            reverse,
+        ),
+        SortKey::Name => cmp_val(name_key(&a.title), name_key(&b.title), reverse),
+        SortKey::Held => cmp_val(a.held, b.held, reverse),
+        SortKey::Attendees => cmp_desc(a.attendees.len(), b.attendees.len(), reverse),
+        _ => Ordering::Equal,
+    }
+}
+
+fn cmp_note(a: &Note, b: &Note, key: SortKey, reverse: bool) -> Ordering {
+    match key {
+        SortKey::Pinned => cmp_desc(a.pinned, b.pinned, reverse),
+        SortKey::Name => cmp_val(name_key(&a.text), name_key(&b.text), reverse),
+        SortKey::Length => cmp_desc(a.body.trim().len(), b.body.trim().len(), reverse),
+        _ => Ordering::Equal,
+    }
 }
 
 /// Append an activity line, trimming the oldest once the buffer is full.
@@ -3830,6 +4553,82 @@ fn parse_todo_input(raw: &str) -> (String, Priority, Option<NaiveDate>, Vec<Stri
         due,
         crate::model::normalize_tags(tags),
     )
+}
+
+/// Prompt text for a new meeting — the one place the input syntax is spelled out.
+const MEETING_PROMPT: &str = "New meeting   (@YYYY-MM-DD · 14:30 · +person)";
+
+/// Pull the date and start time out of a meeting input: `@YYYY-MM-DD` sets the
+/// date (`fallback` when absent), a bare `14:30` (or `9:00`) sets the time.
+fn parse_meeting_when(raw: &str, fallback: NaiveDate) -> (NaiveDate, Option<String>) {
+    let mut date = fallback;
+    let mut time = None;
+    for tok in raw.split_whitespace() {
+        if let Some(rest) = tok.strip_prefix('@')
+            && let Ok(d) = NaiveDate::parse_from_str(rest, "%Y-%m-%d")
+        {
+            date = d;
+        } else if let Some(t) = parse_clock(tok) {
+            time = Some(t);
+        }
+    }
+    (date, time)
+}
+
+/// `14:30` / `9:05` -> `Some("14:30")`. Anything else -> `None`.
+fn parse_clock(tok: &str) -> Option<String> {
+    let (h, m) = tok.split_once(':')?;
+    let h: u32 = h.parse().ok()?;
+    let m: u32 = m.parse().ok()?;
+    (h < 24 && m < 60).then(|| format!("{h:02}:{m:02}"))
+}
+
+/// Parse `Design review @2026-09-05 14:30 +ana +you` into
+/// (title, date, time, attendees). `@date` and a bare `HH:MM` set when it is;
+/// `+name` tokens are attendees; everything else is the title. `None` when no
+/// title is left.
+fn parse_meeting_input(
+    raw: &str,
+    fallback: NaiveDate,
+) -> Option<(String, NaiveDate, Option<String>, Vec<String>)> {
+    let (date, time) = parse_meeting_when(raw, fallback);
+    let mut attendees: Vec<String> = Vec::new();
+    let mut words = Vec::new();
+
+    for tok in raw.split_whitespace() {
+        if tok.starts_with('@') && tok.len() > 1 {
+            continue;
+        }
+        if parse_clock(tok).is_some() {
+            continue;
+        }
+        if let Some(name) = tok.strip_prefix('+') {
+            let name = name.trim();
+            // Same person twice (however they were capitalised) counts once.
+            if !name.is_empty() && !attendees.iter().any(|a| a.eq_ignore_ascii_case(name)) {
+                attendees.push(name.to_string());
+            }
+            continue;
+        }
+        words.push(tok);
+    }
+
+    let title = words.join(" ").trim().to_string();
+    (!title.is_empty()).then_some((title, date, time, attendees))
+}
+
+/// The editable form of a meeting — what `e` puts in the input.
+fn meeting_edit_string(m: &Meeting) -> String {
+    let mut out = format!("{} @{}", m.title, m.date.format("%Y-%m-%d"));
+    if let Some(t) = &m.time {
+        out.push(' ');
+        out.push_str(t);
+    }
+    for a in &m.attendees {
+        out.push_str(" +");
+        out.push_str(a);
+    }
+    out
 }
 
 /// Parse `Launch v1 @2026-09-15` into (title, date), defaulting to `fallback`.
@@ -4112,6 +4911,17 @@ fn run_sync(
 mod tests {
     use super::*;
 
+    /// An app holding a single empty project — a base for the sorting tests.
+    fn test_app() -> App {
+        let mut store = Store::default();
+        store.projects.push(Project::new("P"));
+        App::new(store, Config::default(), None, None)
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
     #[test]
     fn step_clamps_within_bounds() {
         assert_eq!(step(0, -1, 5), 0);
@@ -4222,21 +5032,266 @@ mod tests {
     }
 
     #[test]
-    fn priority_sort_key_floats_chosen_priority() {
-        let mut v = [Priority::Low, Priority::High, Priority::Medium, Priority::Low];
-        v.sort_by_key(|p| priority_sort_key(*p, Priority::High));
+    fn parse_meeting_input_splits_when_who_and_title() {
+        let today = NaiveDate::from_ymd_opt(2026, 9, 2).unwrap();
+        let (title, date, time, who) =
+            parse_meeting_input("Design review @2026-09-05 14:30 +ana +You +ANA", today).unwrap();
+        assert_eq!(title, "Design review");
+        assert_eq!(date, NaiveDate::from_ymd_opt(2026, 9, 5).unwrap());
+        assert_eq!(time.as_deref(), Some("14:30"));
+        // The same person twice, however capitalised, lands once.
+        assert_eq!(who, vec!["ana", "You"]);
+
+        // No date given — today. No time — none. Single-digit hours pad.
+        let (title, date, time, who) = parse_meeting_input("Standup 9:05", today).unwrap();
+        assert_eq!((title.as_str(), date), ("Standup", today));
+        assert_eq!(time.as_deref(), Some("09:05"));
+        assert!(who.is_empty());
+
+        // A title is required; a bare date isn't a meeting.
+        assert!(parse_meeting_input("@2026-09-05 +ana", today).is_none());
+        // Nonsense clocks stay part of the title.
+        let (title, _, time, _) = parse_meeting_input("Sync 99:99", today).unwrap();
+        assert_eq!(title, "Sync 99:99");
+        assert!(time.is_none());
+    }
+
+    #[test]
+    fn meeting_edit_string_roundtrips_through_the_parser() {
+        let today = NaiveDate::from_ymd_opt(2026, 9, 2).unwrap();
+        let mut m = Meeting::new("Kickoff", NaiveDate::from_ymd_opt(2026, 10, 1).unwrap());
+        m.time = Some("08:30".into());
+        m.attendees = vec!["Ana".into(), "Sam".into()];
+        let (title, date, time, who) =
+            parse_meeting_input(&meeting_edit_string(&m), today).unwrap();
+        assert_eq!(title, m.title);
+        assert_eq!(date, m.date);
+        assert_eq!(time, m.time);
+        assert_eq!(who, m.attendees);
+    }
+
+    #[test]
+    fn sorting_meetings_puts_the_earliest_slot_first() {
+        let mut app = test_app();
+        app.tab = Tab::Meetings;
+        app.focus = Focus::Content;
+        let day = |d: u32| NaiveDate::from_ymd_opt(2026, 9, d).unwrap();
+        let p = app.current_project_mut().unwrap();
+        let mut afternoon = Meeting::new("afternoon", day(4));
+        afternoon.time = Some("15:00".into());
+        let mut morning = Meeting::new("morning", day(4));
+        morning.time = Some("09:00".into());
+        let untimed = Meeting::new("sometime", day(4));
+        let mut earlier = Meeting::new("earlier day", day(3));
+        earlier.held = true;
+        p.meetings = vec![untimed, afternoon, earlier, morning];
+        app.meeting_idx = 1; // "afternoon"
+
+        app.apply_sort(SortScope::Meetings, SortKey::Date, false);
+        let order: Vec<&str> = app
+            .current_project()
+            .unwrap()
+            .meetings
+            .iter()
+            .map(|m| m.title.as_str())
+            .collect();
+        // Earlier day first, then that day's timed slots, then the untimed one.
+        assert_eq!(order, ["earlier day", "morning", "afternoon", "sometime"]);
+        assert_eq!(app.current_meeting().unwrap().title, "afternoon");
+
+        app.apply_sort(SortScope::Meetings, SortKey::Held, false);
         assert_eq!(
-            v,
-            [Priority::High, Priority::Medium, Priority::Low, Priority::Low]
+            app.current_project()
+                .unwrap()
+                .meetings
+                .last()
+                .unwrap()
+                .title,
+            "earlier day"
+        );
+    }
+
+    #[test]
+    fn the_meetings_tab_edits_the_selected_meeting() {
+        let mut app = test_app();
+        let day = |d: u32| NaiveDate::from_ymd_opt(2026, 9, d).unwrap();
+        app.current_project_mut().unwrap().meetings = vec![
+            Meeting::new("standup", day(3)),
+            Meeting::new("retro", day(9)),
+        ];
+
+        // `5` opens the tab, `j` moves onto the second meeting.
+        app.handle_key(key(KeyCode::Char('5')));
+        assert_eq!(app.tab, Tab::Meetings);
+        assert_eq!(app.focus, Focus::Content);
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(app.current_meeting().unwrap().title, "retro");
+
+        // `x` marks it held, `l` steps into the notes pane, `N` opens the editor.
+        app.handle_key(key(KeyCode::Char('x')));
+        assert!(app.current_meeting().unwrap().held);
+        app.handle_key(key(KeyCode::Char('l')));
+        assert_eq!(app.focus, Focus::Detail);
+        app.handle_key(key(KeyCode::Char('N')));
+        assert!(matches!(
+            app.mode,
+            Mode::EditBody(ref e) if e.target == EditTarget::MeetingNote(1)
+        ));
+
+        // Typing in the editor and saving writes the meeting's notes.
+        app.handle_key(key(KeyCode::Char('h')));
+        app.handle_key(key(KeyCode::Char('i')));
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.current_project().unwrap().meetings[1].note, "hi");
+        assert!(matches!(app.mode, Mode::Normal));
+
+        // `d` asks before deleting, and the confirmation removes it.
+        app.handle_key(key(KeyCode::Char('h')));
+        app.handle_key(key(KeyCode::Char('d')));
+        assert!(matches!(
+            app.mode,
+            Mode::Confirm(ConfirmState {
+                action: ConfirmAction::DeleteMeeting(1),
+                ..
+            })
+        ));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let titles: Vec<&str> = app
+            .current_project()
+            .unwrap()
+            .meetings
+            .iter()
+            .map(|m| m.title.as_str())
+            .collect();
+        assert_eq!(titles, ["standup"]);
+    }
+
+    #[test]
+    fn sort_menu_opens_on_the_order_already_in_force() {
+        let mut app = test_app();
+        app.focus = Focus::Content;
+        app.tab = Tab::Todos;
+        // First open sits on the scope's default ordering, forwards.
+        app.handle_key(key(KeyCode::Char('o')));
+        let Mode::Sort(s) = &app.mode else {
+            panic!("o should open the sort menu")
+        };
+        assert_eq!(s.scope, SortScope::Todos);
+        assert_eq!(s.scope.keys()[s.sel], SortKey::Priority);
+        assert!(!s.reverse);
+        assert!(s.active.is_none());
+
+        // Pick "Name", reversed.
+        app.handle_key(key(KeyCode::Char('j')));
+        app.handle_key(key(KeyCode::Char('j')));
+        app.handle_key(key(KeyCode::Char('r')));
+        app.handle_key(key(KeyCode::Enter));
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(
+            app.sorts[SortScope::Todos.idx()],
+            Some(SortOrder {
+                key: SortKey::Name,
+                reverse: true
+            })
         );
 
-        let mut v = [Priority::Low, Priority::High, Priority::Medium];
-        v.sort_by_key(|p| priority_sort_key(*p, Priority::Medium));
-        assert_eq!(v, [Priority::Medium, Priority::High, Priority::Low]);
+        // Reopening lands back on it, still reversed, and marks it as active.
+        app.handle_key(key(KeyCode::Char('o')));
+        let Mode::Sort(s) = &app.mode else {
+            panic!("expected the sort menu")
+        };
+        assert_eq!(s.scope.keys()[s.sel], SortKey::Name);
+        assert!(s.reverse);
+        assert_eq!(s.active.map(|o| o.key), Some(SortKey::Name));
+    }
 
-        let mut v = [Priority::High, Priority::Medium, Priority::Low];
-        v.sort_by_key(|p| priority_sort_key(*p, Priority::Low));
-        assert_eq!(v, [Priority::Low, Priority::High, Priority::Medium]);
+    #[test]
+    fn sorting_todos_reorders_and_keeps_the_selection() {
+        let mut app = test_app();
+        let today = Local::now().date_naive();
+        let p = app.current_project_mut().unwrap();
+        p.todos = vec![Todo::new("beta"), Todo::new("alpha"), Todo::new("gamma")];
+        p.todos[0].priority = Priority::Low;
+        p.todos[1].priority = Priority::High;
+        p.todos[2].priority = Priority::Medium;
+        p.todos[0].due = Some(today + chrono::Duration::days(5));
+        p.todos[2].due = Some(today);
+        app.todo_idx = 0; // "beta"
+
+        app.apply_sort(SortScope::Todos, SortKey::Priority, false);
+        let titles: Vec<&str> = app
+            .current_project()
+            .unwrap()
+            .todos
+            .iter()
+            .map(|t| t.title.as_str())
+            .collect();
+        assert_eq!(titles, ["alpha", "gamma", "beta"]);
+        assert_eq!(app.current_todo().unwrap().title, "beta");
+
+        app.apply_sort(SortScope::Todos, SortKey::Name, true);
+        let titles: Vec<&str> = app
+            .current_project()
+            .unwrap()
+            .todos
+            .iter()
+            .map(|t| t.title.as_str())
+            .collect();
+        assert_eq!(titles, ["gamma", "beta", "alpha"]);
+        assert_eq!(app.current_todo().unwrap().title, "beta");
+
+        // Undated todos stay at the bottom in both directions.
+        app.apply_sort(SortScope::Todos, SortKey::Due, false);
+        let titles: Vec<&str> = app
+            .current_project()
+            .unwrap()
+            .todos
+            .iter()
+            .map(|t| t.title.as_str())
+            .collect();
+        assert_eq!(titles, ["gamma", "beta", "alpha"]);
+        app.apply_sort(SortScope::Todos, SortKey::Due, true);
+        let titles: Vec<&str> = app
+            .current_project()
+            .unwrap()
+            .todos
+            .iter()
+            .map(|t| t.title.as_str())
+            .collect();
+        assert_eq!(titles, ["beta", "gamma", "alpha"]);
+    }
+
+    #[test]
+    fn sorting_projects_and_notes_uses_their_own_keys() {
+        let mut app = test_app();
+        app.store.projects = vec![Project::new("zeta"), Project::new("alpha")];
+        app.store.projects[0].todos = vec![Todo::new("a"), Todo::new("b")];
+        app.project_idx = 0; // "zeta"
+
+        app.apply_sort(SortScope::Projects, SortKey::Name, false);
+        assert_eq!(app.store.projects[0].name, "alpha");
+        assert_eq!(app.current_project().unwrap().name, "zeta");
+
+        // Most open todos first.
+        app.apply_sort(SortScope::Projects, SortKey::Open, false);
+        assert_eq!(app.store.projects[0].name, "zeta");
+
+        let p = app.current_project_mut().unwrap();
+        p.notes = vec![
+            Note::new("plain", false),
+            Note::new("starred", true).with_body("body"),
+        ];
+        app.note_idx = 0;
+        app.apply_sort(SortScope::Notes, SortKey::Pinned, false);
+        let texts: Vec<&str> = app
+            .current_project()
+            .unwrap()
+            .notes
+            .iter()
+            .map(|n| n.text.as_str())
+            .collect();
+        assert_eq!(texts, ["starred", "plain"]);
+        assert_eq!(app.current_note().unwrap().text, "plain");
     }
 
     #[test]

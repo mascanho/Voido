@@ -1,10 +1,14 @@
 //! SQLite storage backend for voido.
 
-use crate::model::{Attachment, Milestone, Note, Priority, Project, Store, Subtask, Todo};
+use crate::model::{Attachment, Meeting, Milestone, Note, Priority, Project, Store, Subtask, Todo};
+use chrono::NaiveDate;
 use rusqlite::{Connection, params};
 
 /// Bump when the schema changes and add a matching arm in `migrate`.
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 8;
+
+/// A raw `projects` row: (id, name, description, repo, tags, created).
+type ProjectRow = (i64, String, String, Option<String>, String, String);
 
 /// A raw `todos` row before subtasks/attachments are attached:
 /// (id, title, done, priority, due, note, tags).
@@ -42,7 +46,8 @@ impl SqliteStorage {
                 name TEXT NOT NULL,
                 description TEXT DEFAULT '',
                 repo TEXT DEFAULT NULL,
-                tags TEXT NOT NULL DEFAULT ''
+                tags TEXT NOT NULL DEFAULT '',
+                created TEXT NOT NULL DEFAULT ''
             );
             CREATE TABLE IF NOT EXISTS todos (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -88,6 +93,17 @@ impl SqliteStorage {
                 title TEXT NOT NULL,
                 date TEXT NOT NULL,
                 done INTEGER DEFAULT 0,
+                FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS meetings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                date TEXT NOT NULL,
+                time TEXT DEFAULT NULL,
+                attendees TEXT NOT NULL DEFAULT '',
+                note TEXT NOT NULL DEFAULT '',
+                held INTEGER NOT NULL DEFAULT 0,
                 FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
             );",
             )
@@ -144,9 +160,7 @@ impl SqliteStorage {
                 // 3 -> 4: subtasks gained a `note`.
                 3 => self
                     .conn
-                    .execute_batch(
-                        "ALTER TABLE subtasks ADD COLUMN note TEXT NOT NULL DEFAULT '';",
-                    )
+                    .execute_batch("ALTER TABLE subtasks ADD COLUMN note TEXT NOT NULL DEFAULT '';")
                     .map_err(|e| e.to_string())?,
                 // 4 -> 5: attachments can belong to a subtask (NULL = todo-level).
                 4 => self
@@ -162,6 +176,31 @@ impl SqliteStorage {
                         "ALTER TABLE projects ADD COLUMN tags TEXT NOT NULL DEFAULT '';
                          ALTER TABLE todos ADD COLUMN tags TEXT NOT NULL DEFAULT '';
                          ALTER TABLE subtasks ADD COLUMN tags TEXT NOT NULL DEFAULT '';",
+                    )
+                    .map_err(|e| e.to_string())?,
+                // 6 -> 7: projects remember the day they were created, so they
+                // can be ordered by it.
+                6 => self
+                    .conn
+                    .execute_batch(
+                        "ALTER TABLE projects ADD COLUMN created TEXT NOT NULL DEFAULT '';",
+                    )
+                    .map_err(|e| e.to_string())?,
+                // 7 -> 8: projects gained meetings.
+                7 => self
+                    .conn
+                    .execute_batch(
+                        "CREATE TABLE IF NOT EXISTS meetings (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            project_id INTEGER NOT NULL,
+                            title TEXT NOT NULL,
+                            date TEXT NOT NULL,
+                            time TEXT DEFAULT NULL,
+                            attendees TEXT NOT NULL DEFAULT '',
+                            note TEXT NOT NULL DEFAULT '',
+                            held INTEGER NOT NULL DEFAULT 0,
+                            FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+                         );",
                     )
                     .map_err(|e| e.to_string())?,
                 other => return Err(format!("no migration path from schema version {other}")),
@@ -182,24 +221,37 @@ impl SqliteStorage {
 
         let mut stmt = self
             .conn
-            .prepare("SELECT id, name, description, repo, tags FROM projects ORDER BY id")
+            .prepare("SELECT id, name, description, repo, tags, created FROM projects ORDER BY id")
             .map_err(|e| e.to_string())?;
-        let project_rows: Vec<(i64, String, String, Option<String>, String)> = stmt
+        let project_rows: Vec<ProjectRow> = stmt
             .query_map([], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
             })
             .map_err(|e| e.to_string())?
             .collect::<Result<_, _>>()
             .map_err(|e| e.to_string())?;
 
-        for (pid, name, description, repo, tags) in project_rows {
+        for (pid, name, description, repo, tags, created) in project_rows {
             let mut project = Project::new(&name);
             project.description = description;
             project.repo = repo;
             project.tags = split_tags(&tags);
+            // Blank on rows written before the column existed — those keep the
+            // today's-date `Project::new` gave them.
+            if let Ok(d) = NaiveDate::parse_from_str(&created, "%Y-%m-%d") {
+                project.created = d;
+            }
             project.todos = self.load_todos(pid)?;
             project.notes = self.load_notes(pid)?;
             project.milestones = self.load_milestones(pid)?;
+            project.meetings = self.load_meetings(pid)?;
             store.projects.push(project);
         }
 
@@ -330,6 +382,31 @@ impl SqliteStorage {
 
     /// Rewrite the whole store in a single transaction: either every row lands
     /// or the on-disk database is left untouched.
+    fn load_meetings(&self, project_id: i64) -> Result<Vec<Meeting>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT title, date, time, attendees, note, held FROM meetings WHERE project_id = ?1 ORDER BY id",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([project_id], |row| {
+                Ok(Meeting {
+                    title: row.get(0)?,
+                    date: NaiveDate::parse_from_str(&row.get::<_, String>(1)?, "%Y-%m-%d")
+                        .unwrap_or_else(|_| chrono::Local::now().date_naive()),
+                    time: row.get::<_, Option<String>>(2)?.filter(|t| !t.is_empty()),
+                    attendees: split_tags(&row.get::<_, String>(3)?),
+                    note: row.get(4)?,
+                    held: row.get::<_, i64>(5)? != 0,
+                })
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<_, _>>()
+            .map_err(|e| e.to_string())?;
+        Ok(rows)
+    }
+
     pub fn save(&self, store: &Store) -> Result<(), String> {
         let tx = self
             .conn
@@ -342,18 +419,20 @@ impl SqliteStorage {
              DELETE FROM todos;
              DELETE FROM notes;
              DELETE FROM milestones;
+             DELETE FROM meetings;
              DELETE FROM projects;",
         )
         .map_err(|e| e.to_string())?;
 
         for project in &store.projects {
             tx.execute(
-                "INSERT INTO projects (name, description, repo, tags) VALUES (?1, ?2, ?3, ?4)",
+                "INSERT INTO projects (name, description, repo, tags, created) VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![
                     project.name,
                     project.description,
                     project.repo,
                     project.tags.join(","),
+                    project.created.format("%Y-%m-%d").to_string(),
                 ],
             )
             .map_err(|e| e.to_string())?;
@@ -416,6 +495,22 @@ impl SqliteStorage {
                 .map_err(|e| e.to_string())?;
             }
 
+            for meeting in &project.meetings {
+                tx.execute(
+                    "INSERT INTO meetings (project_id, title, date, time, attendees, note, held) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        pid,
+                        meeting.title,
+                        meeting.date.format("%Y-%m-%d").to_string(),
+                        meeting.time,
+                        meeting.attendees.join(","),
+                        meeting.note,
+                        meeting.held as i64,
+                    ],
+                )
+                .map_err(|e| e.to_string())?;
+            }
+
             for ms in &project.milestones {
                 tx.execute(
                     "INSERT INTO milestones (project_id, title, date, done) VALUES (?1, ?2, ?3, ?4)",
@@ -437,7 +532,7 @@ impl SqliteStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Attachment, Project, Subtask, Todo};
+    use crate::model::{Attachment, Meeting, Project, Subtask, Todo};
 
     #[test]
     fn round_trips_todo_note_and_attachments() {
@@ -448,6 +543,17 @@ mod tests {
         let mut store = Store::default();
         let mut p = Project::new("P");
         p.tags = vec!["work".into(), "q3".into()];
+        let created = NaiveDate::from_ymd_opt(2025, 4, 9).unwrap();
+        p.created = created;
+        let mut held = Meeting::new("kickoff", NaiveDate::from_ymd_opt(2025, 4, 10).unwrap());
+        held.time = Some("09:30".into());
+        held.attendees = vec!["Ana".into(), "Sam".into()];
+        held.note = "## Minutes\n\nShipped the plan.".to_string();
+        held.held = true;
+        p.meetings = vec![
+            held,
+            Meeting::new("retro", NaiveDate::from_ymd_opt(2025, 5, 2).unwrap()),
+        ];
         let mut t = Todo::new("write docs");
         t.note = "# heading\n\nsome **body**".into();
         t.tags = vec!["docs".into()];
@@ -478,7 +584,62 @@ mod tests {
         assert_eq!(loaded.projects[0].tags, vec!["work", "q3"]);
         assert_eq!(lt.tags, vec!["docs"]);
         assert_eq!(lt.subtasks[0].tags, vec!["draft"]);
+        assert_eq!(loaded.projects[0].created, created);
+        let lm = &loaded.projects[0].meetings;
+        assert_eq!(lm.len(), 2);
+        assert_eq!(lm[0].title, "kickoff");
+        assert_eq!(lm[0].time.as_deref(), Some("09:30"));
+        assert_eq!(lm[0].attendees, vec!["Ana", "Sam"]);
+        assert_eq!(lm[0].note, "## Minutes\n\nShipped the plan.");
+        assert!(lm[0].held);
+        // A meeting with no time or attendees comes back blank, not empty-string.
+        assert_eq!(lm[1].title, "retro");
+        assert!(lm[1].time.is_none());
+        assert!(lm[1].attendees.is_empty());
+        assert!(!lm[1].held);
 
         let _ = std::fs::remove_file(&dir);
+    }
+
+    /// A database written before `projects.created` existed must gain the column
+    /// on open, with the rows already in it left readable.
+    #[test]
+    fn migrates_a_pre_created_column_database() {
+        let path = std::env::temp_dir().join(format!("voido-migrate-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE projects (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    description TEXT DEFAULT '',
+                    repo TEXT DEFAULT NULL,
+                    tags TEXT NOT NULL DEFAULT ''
+                 );
+                 INSERT INTO projects (name, tags) VALUES ('Old', 'work');",
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 6).unwrap();
+        }
+
+        let db = SqliteStorage::open(&path).unwrap();
+        let loaded = db.load().unwrap();
+        assert_eq!(loaded.projects.len(), 1);
+        assert_eq!(loaded.projects[0].name, "Old");
+        assert_eq!(loaded.projects[0].tags, vec!["work"]);
+        // No stored date — the project keeps the one `Project::new` gave it.
+        assert_eq!(
+            loaded.projects[0].created,
+            chrono::Local::now().date_naive()
+        );
+        // And it round-trips once saved through the new column.
+        db.save(&loaded).unwrap();
+        assert_eq!(
+            db.load().unwrap().projects[0].created,
+            chrono::Local::now().date_naive()
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 }

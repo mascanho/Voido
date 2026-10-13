@@ -57,10 +57,18 @@ pub fn render(f: &mut Frame, app: &App) {
         if app.tab == Tab::Notes && app.note_expanded && app.focus == Focus::Detail {
             // Full-width note mode — projects + note body (or its editor) only.
             let body = Layout::horizontal([Constraint::Percentage(30), Constraint::Percentage(70)])
+<<<<<<< Updated upstream
                 .split(body_rect);
+=======
+<<<<<<< Updated upstream
+                .split(rows[1]);
+>>>>>>> Stashed changes
             rects.projects = body[0];
+=======
+                .split(body_rect);
+>>>>>>> Stashed changes
             rects.detail = body[1];
-            render_projects(f, body[0], app);
+            render_projects_rail(f, body[0], app, &mut rects);
             if let Mode::EditBody(state) = &app.mode {
                 render_edit_body_pane(f, body[1], state, app);
             } else {
@@ -72,11 +80,19 @@ pub fn render(f: &mut Frame, app: &App) {
                 Constraint::Percentage(30),
                 Constraint::Percentage(40),
             ])
+<<<<<<< Updated upstream
             .split(body_rect);
+=======
+<<<<<<< Updated upstream
+            .split(rows[1]);
+>>>>>>> Stashed changes
             rects.projects = body[0];
+=======
+            .split(body_rect);
+>>>>>>> Stashed changes
             rects.content = body[1];
             rects.detail = body[2];
-            render_projects(f, body[0], app);
+            render_projects_rail(f, body[0], app, &mut rects);
             render_content(f, body[1], app);
             match (&app.mode, app.tab) {
                 (Mode::EditBody(state), _) => render_edit_body_pane(f, body[2], state, app),
@@ -100,10 +116,18 @@ pub fn render(f: &mut Frame, app: &App) {
         }
     } else {
         let body = Layout::horizontal([Constraint::Percentage(30), Constraint::Percentage(70)])
+<<<<<<< Updated upstream
             .split(body_rect);
+=======
+<<<<<<< Updated upstream
+            .split(rows[1]);
+>>>>>>> Stashed changes
         rects.projects = body[0];
+=======
+            .split(body_rect);
+>>>>>>> Stashed changes
         rects.content = body[1];
-        render_projects(f, body[0], app);
+        render_projects_rail(f, body[0], app, &mut rects);
         render_content(f, body[1], app);
     }
 
@@ -217,8 +241,123 @@ fn weather_clock_line(app: &App) -> Line<'static> {
     Line::from(spans).centered()
 }
 
+/// The left rail: the project list, with the month calendar docked at the
+/// bottom (collapsible to a one-line strip with `c`).
+fn render_projects_rail(f: &mut Frame, area: Rect, app: &App, rects: &mut PaneRects) {
+    // A full calendar is 9 rows tall and 22 columns wide; only dock it when the
+    // project list still keeps a usable height beside it.
+    const CAL_H: u16 = 9;
+    const CAL_W: u16 = 22;
+    let cal_h = if app.config.calendar_hidden { 1 } else { CAL_H };
+    if area.width < CAL_W || area.height < cal_h + 6 {
+        rects.projects = area;
+        render_projects(f, area, app);
+        return;
+    }
+    let split = Layout::vertical([Constraint::Min(0), Constraint::Length(cal_h)]).split(area);
+    rects.projects = split[0];
+    rects.calendar = split[1];
+    render_projects(f, split[0], app);
+    render_calendar(f, split[1], app);
+}
+
+/// This month at a glance. Today is highlighted; days carrying an open todo,
+/// milestone or meeting of the selected project are marked (red once overdue).
+fn render_calendar(f: &mut Frame, area: Rect, app: &App) {
+    use chrono::Datelike;
+
+    let today = Local::now().date_naive();
+    let sel = app.cal_sel;
+    let focused = app.calendar_focused();
+    let month = sel.format(" %B %Y ").to_string();
+
+    if app.config.calendar_hidden {
+        let line = Line::from(vec![
+            Span::styled("─ ▸", Style::new().fg(border())),
+            Span::styled(month, Style::new().fg(subtle()).bold()),
+            Span::styled("c ", Style::new().fg(border())),
+        ]);
+        f.render_widget(Paragraph::new(line), area);
+        return;
+    }
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(if focused { accent() } else { border() }))
+        .title(Span::styled(
+            format!(" ▾{month}"),
+            Style::new()
+                .fg(if focused { accent() } else { subtle() })
+                .bold(),
+        ))
+        .title_bottom(Line::from(Span::styled(" c ", Style::new().fg(border()))).right_aligned());
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    // Dates that have something open on them in the selected project.
+    let mut marked: Vec<NaiveDate> = Vec::new();
+    if let Some(p) = app.current_project() {
+        marked.extend(p.todos.iter().filter(|t| !t.done).filter_map(|t| t.due));
+        marked.extend(p.milestones.iter().filter(|m| !m.done).map(|m| m.date));
+        marked.extend(p.meetings.iter().filter(|m| !m.held).map(|m| m.date));
+    }
+
+    let first = sel.with_day(1).unwrap_or(sel);
+    let lead = first.weekday().num_days_from_monday() as usize;
+    let days_in_month = (28..=31)
+        .rev()
+        .find(|&d| first.with_day(d).is_some())
+        .unwrap_or(28);
+
+    // Centre the grid inside the box (`calendar_day_at` maps clicks back).
+    let pad = " ".repeat(inner.width.saturating_sub(crate::app::CAL_GRID_W) as usize / 2);
+    let mut lines = vec![Line::from(vec![
+        Span::raw(pad.clone()),
+        Span::styled("Mo Tu We Th Fr Sa Su", Style::new().fg(subtle())),
+    ])];
+
+    let mut row: Vec<Span> = vec![Span::raw(pad.clone()), Span::raw("   ".repeat(lead))];
+    for day in 1..=days_in_month {
+        let date = first.with_day(day).unwrap_or(first);
+        let col = (lead + day as usize - 1) % 7;
+        let style = if date == sel && focused {
+            Style::new().fg(on_accent()).bg(accent()).bold()
+        } else if date == today {
+            Style::new().fg(accent()).bg(sel_bg()).bold()
+        } else if marked.contains(&date) {
+            if date < today {
+                Style::new().fg(red()).bold()
+            } else {
+                Style::new().fg(yellow()).bold()
+            }
+        } else if col >= 5 {
+            Style::new().fg(subtle())
+        } else {
+            Style::new().fg(text())
+        };
+        // The selection stays visible (underlined) once focus leaves.
+        let style = if date == sel && !focused && date != today {
+            style.add_modifier(Modifier::UNDERLINED)
+        } else {
+            style
+        };
+        row.push(Span::styled(format!("{day:>2}"), style));
+        if col == 6 {
+            lines.push(Line::from(std::mem::take(&mut row)));
+            row.push(Span::raw(pad.clone()));
+        } else {
+            row.push(Span::raw(" "));
+        }
+    }
+    if row.len() > 1 {
+        lines.push(Line::from(row));
+    }
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
 fn render_projects(f: &mut Frame, area: Rect, app: &App) {
-    let focused = app.focus == Focus::Projects;
+    let focused = app.focus == Focus::Projects && !app.calendar_focused();
     let block = panel(" Projects ".to_string(), focused);
 
     if app.store.projects.is_empty() {
@@ -1538,7 +1677,15 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
         | Mode::Sort(_) => ("N", accent()),
     };
     let pane_label = match app.focus {
+<<<<<<< Updated upstream
         _ if app.note_full => "NOTE·FULL",
+=======
+<<<<<<< Updated upstream
+=======
+        _ if app.note_full => "NOTE·FULL",
+        Focus::Projects if app.calendar_focused() => "CALENDAR",
+>>>>>>> Stashed changes
+>>>>>>> Stashed changes
         Focus::Projects => "PROJECTS",
         Focus::Content => match app.tab {
             Tab::Overview => "OVERVIEW",
@@ -1943,11 +2090,29 @@ fn render_help(f: &mut Frame, area: Rect) {
     ];
     const COL2: &[Row] = &[
         ("", "PROJECTS"),
+<<<<<<< Updated upstream
+=======
+<<<<<<< Updated upstream
+        ("a  r  d", "add / rename / del"),
+        ("l", "open project"),
+        ("o", "show repo activity"),
+=======
+>>>>>>> Stashed changes
         ("a r d", "add · rename · delete"),
         ("l", "open"),
         ("i", "detail panel"),
         ("t", "tags"),
         ("o  R", "sort · repo view"),
+<<<<<<< Updated upstream
+=======
+        ("c", "show / hide calendar"),
+        ("", ""),
+        ("", "CALENDAR  (j past last project)"),
+        ("hjkl ←↓↑→", "move day · week"),
+        ("[ ]  t", "month · today"),
+        ("enter  esc", "open in schedule · back"),
+>>>>>>> Stashed changes
+>>>>>>> Stashed changes
         ("", ""),
         ("", "OVERVIEW"),
         ("e  r", "description · rename"),

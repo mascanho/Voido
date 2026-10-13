@@ -34,6 +34,8 @@ pub enum Focus {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PaneRects {
     pub projects: Rect,
+    /// The month calendar under Projects (just its title strip when collapsed).
+    pub calendar: Rect,
     pub content: Rect,
     pub detail: Rect,
 }
@@ -661,6 +663,11 @@ pub struct App {
     /// Scroll offset of the meeting agenda / minutes pane.
     pub meeting_note_scroll: u16,
     pub note_expanded: bool,
+<<<<<<< Updated upstream
+=======
+<<<<<<< Updated upstream
+=======
+>>>>>>> Stashed changes
     /// `^f`: the note on screen fills the whole window, panes and all.
     pub note_full: bool,
     /// `n` toggles the selected todo's note into the detail pane; `n` inside the
@@ -671,6 +678,13 @@ pub struct App {
     /// While a subtask note is open, `l` steps focus into that pane so `j`/`k`
     /// scroll it; `h` / `esc` steps back out to the subtask list.
     pub sub_note_focus: bool,
+<<<<<<< Updated upstream
+=======
+    /// Focus sits on the calendar under Projects (only while `focus` is
+    /// `Projects`); `cal_sel` is its selected day, and picks the month shown.
+    pub cal_focus: bool,
+    pub cal_sel: NaiveDate,
+>>>>>>> Stashed changes
     pub todo_note_scroll: u16,
     pub sub_note_scroll: u16,
     /// `i` toggles an inline detail panel (tags, dates, counts…) under the
@@ -693,6 +707,10 @@ pub struct App {
     last_activity_status: String,
     /// Transient corner notification, cleared by `tick_toast` once it's old.
     pub toast: Option<Toast>,
+<<<<<<< Updated upstream
+=======
+>>>>>>> Stashed changes
+>>>>>>> Stashed changes
     pub timeline_idx: usize,
     pub deadline_filter: DeadlineFilter,
     /// The ordering last applied to each list, indexed by `SortScope`. Kept so
@@ -790,13 +808,26 @@ impl App {
             subtask_idx: 0,
             note_idx: 0,
             note_scroll: 0,
+<<<<<<< Updated upstream
+=======
+<<<<<<< Updated upstream
+=======
+>>>>>>> Stashed changes
             meeting_idx: 0,
             meeting_note_scroll: 0,
             todo_note_open: false,
             sub_note_open: false,
             sub_note_focus: false,
+<<<<<<< Updated upstream
             todo_note_scroll: 0,
             sub_note_scroll: 0,
+=======
+            cal_focus: false,
+            cal_sel: Local::now().date_naive(),
+            todo_note_scroll: 0,
+            sub_note_scroll: 0,
+>>>>>>> Stashed changes
+>>>>>>> Stashed changes
             note_expanded: false,
             note_full: false,
             project_info: false,
@@ -1779,6 +1810,20 @@ impl App {
             return true;
         }
 
+        if r.calendar.contains(pos) {
+            // The title row (or the collapsed strip) folds it; a day selects it.
+            if pos.y == r.calendar.y || self.config.calendar_hidden {
+                self.toggle_calendar();
+            } else if let Some(d) = calendar_day_at(r.calendar, pos, self.cal_sel) {
+                self.cal_sel = d;
+                self.focus = Focus::Projects;
+                self.cal_focus = true;
+                self.cal_status();
+            }
+            return true;
+        }
+        self.cal_focus = false;
+
         if r.projects.contains(pos) {
             self.focus = Focus::Projects;
             if let Some(i) = row_at(r.projects, pos.y, self.store.projects.len()) {
@@ -1904,6 +1949,11 @@ impl App {
 
         let g_pending = std::mem::replace(&mut self.pending_g, false);
 
+<<<<<<< Updated upstream
+=======
+<<<<<<< Updated upstream
+=======
+>>>>>>> Stashed changes
         // A full-screen note swallows the navigation keys — there are no panes
         // to move between — but leaves the global ones below it alone.
         if self.note_full
@@ -1918,6 +1968,19 @@ impl App {
             return;
         }
 
+<<<<<<< Updated upstream
+=======
+        if self.calendar_focused() && self.handle_calendar_key(key) {
+            return;
+        }
+        self.cal_focus = self.calendar_focused()
+            && !matches!(
+                key.code,
+                KeyCode::Tab | KeyCode::BackTab | KeyCode::Char('1'..='5')
+            );
+
+>>>>>>> Stashed changes
+>>>>>>> Stashed changes
         match key.code {
             KeyCode::Char('q') => {
                 self.mode = Mode::Confirm(ConfirmState {
@@ -2001,9 +2064,111 @@ impl App {
 
     // ---- projects panel ----------------------------------------------
 
+    /// Show / collapse the month calendar under Projects; remembered in settings.
+    fn toggle_calendar(&mut self) {
+        self.config.calendar_hidden = !self.config.calendar_hidden;
+        if self.config.calendar_hidden {
+            self.cal_focus = false;
+        }
+        let _ = self.config.save();
+    }
+
+    /// The calendar is on screen and has the keyboard.
+    pub fn calendar_focused(&self) -> bool {
+        self.cal_focus
+            && self.focus == Focus::Projects
+            && !self.config.calendar_hidden
+            && self.pane_rects.borrow().calendar.height > 1
+    }
+
+    /// What the selected project has on the calendar's selected day.
+    pub fn cal_day_items(&self, date: NaiveDate) -> Vec<String> {
+        let Some(p) = self.current_project() else {
+            return Vec::new();
+        };
+        let todos = p.todos.iter().filter(|t| t.due == Some(date));
+        let miles = p.milestones.iter().filter(|m| m.date == date);
+        let meets = p.meetings.iter().filter(|m| m.date == date);
+        todos
+            .map(|t| format!("○ {}", t.title))
+            .chain(miles.map(|m| format!("◆ {}", m.title)))
+            .chain(meets.map(|m| format!("◷ {}", m.title)))
+            .collect()
+    }
+
+    fn cal_status(&mut self) {
+        let items = self.cal_day_items(self.cal_sel);
+        let day = self.cal_sel.format("%a %-d %b");
+        self.status = if items.is_empty() {
+            format!("{day} — nothing scheduled")
+        } else {
+            format!("{day} — {}", items.join("  ·  "))
+        };
+    }
+
+    /// Keys while the calendar has focus. `false` lets a global key (tab
+    /// switching, search, quit…) fall through to the normal handler.
+    fn handle_calendar_key(&mut self, key: KeyEvent) -> bool {
+        use chrono::{Days, Months};
+        let d = self.cal_sel;
+        let moved = match key.code {
+            KeyCode::Char('h') | KeyCode::Left => d.checked_sub_days(Days::new(1)),
+            KeyCode::Char('l') | KeyCode::Right => d.checked_add_days(Days::new(1)),
+            KeyCode::Char('k') | KeyCode::Up => d.checked_sub_days(Days::new(7)),
+            KeyCode::Char('j') | KeyCode::Down => d.checked_add_days(Days::new(7)),
+            KeyCode::Char('[') | KeyCode::PageUp => d.checked_sub_months(Months::new(1)),
+            KeyCode::Char(']') | KeyCode::PageDown => d.checked_add_months(Months::new(1)),
+            KeyCode::Char('t') => Some(Local::now().date_naive()),
+            KeyCode::Esc => {
+                self.cal_focus = false;
+                self.status.clear();
+                return true;
+            }
+            KeyCode::Char('c') => {
+                self.toggle_calendar();
+                self.status.clear();
+                return true;
+            }
+            KeyCode::Enter => {
+                // Jump to the Schedule at (or just after) the selected day.
+                self.cal_focus = false;
+                self.deadline_filter = DeadlineFilter::All;
+                self.tab = Tab::Schedule;
+                self.focus = Focus::Content;
+                let tl = self.timeline();
+                self.timeline_idx = tl
+                    .iter()
+                    .position(|e| e.date >= d)
+                    .unwrap_or(tl.len().saturating_sub(1));
+                return true;
+            }
+            KeyCode::Char('q' | '?' | '/' | 'L' | 'm' | 'w' | 's' | '1'..='5')
+            | KeyCode::Tab
+            | KeyCode::BackTab => return false,
+            _ => return true,
+        };
+        if let Some(nd) = moved {
+            self.cal_sel = nd;
+            self.cal_status();
+        }
+        true
+    }
+
     fn handle_projects_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Char('j') | KeyCode::Down => self.move_sel(1),
+            KeyCode::Char('j') | KeyCode::Down => {
+                // Past the last project, step down into the calendar.
+                let last = self.project_idx + 1 >= self.store.projects.len();
+                if last
+                    && !self.config.calendar_hidden
+                    && self.pane_rects.borrow().calendar.height > 1
+                {
+                    self.cal_focus = true;
+                    self.cal_status();
+                } else {
+                    self.move_sel(1);
+                }
+            }
             KeyCode::Char('k') | KeyCode::Up => self.move_sel(-1),
             KeyCode::Char('a') => self.begin_input(
                 "New project   (#tag for tags)",
@@ -2026,10 +2191,21 @@ impl App {
                     });
                 }
             }
+<<<<<<< Updated upstream
+=======
+<<<<<<< Updated upstream
+            KeyCode::Char('o') => self.show_github(),
+=======
+>>>>>>> Stashed changes
             KeyCode::Char('o') => self.open_sort(SortScope::Projects),
             KeyCode::Char('R') => self.show_github(),
             KeyCode::Char('t') => self.open_tags(),
             KeyCode::Char('i') => self.project_info = !self.project_info,
+<<<<<<< Updated upstream
+=======
+            KeyCode::Char('c') => self.toggle_calendar(),
+>>>>>>> Stashed changes
+>>>>>>> Stashed changes
             KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => {
                 if !self.store.projects.is_empty() {
                     self.focus = Focus::Content;
@@ -4273,6 +4449,27 @@ fn tab_at_x(content: Rect, x: u16) -> Option<Tab> {
 /// Map a click's y-coordinate to a list row inside `pane`. Row 0 sits just below
 /// the pane's top border. Returns `None` for clicks on the border or past the
 /// last item (so the click still focuses the pane without moving the selection).
+/// Width of the calendar's day grid: 7 two-digit cells, one space apart.
+pub const CAL_GRID_W: u16 = 20;
+
+/// The day under `pos` in the calendar pane `cal` showing `month`'s month.
+/// Mirrors the layout in `ui::render_calendar`: a border, a weekday row, then
+/// one row per week, the grid centred horizontally.
+fn calendar_day_at(cal: Rect, pos: Position, month: NaiveDate) -> Option<NaiveDate> {
+    use chrono::Datelike;
+    let inner_x = cal.x + 1;
+    let pad = cal.width.saturating_sub(2).saturating_sub(CAL_GRID_W) / 2;
+    let x = pos.x.checked_sub(inner_x + pad)?;
+    let week = pos.y.checked_sub(cal.y + 2)?;
+    if x >= CAL_GRID_W || x % 3 == 2 {
+        return None;
+    }
+    let first = month.with_day(1)?;
+    let lead = first.weekday().num_days_from_monday() as i64;
+    let day = week as i64 * 7 + (x / 3) as i64 - lead + 1;
+    (day >= 1).then(|| first.with_day(day as u32)).flatten()
+}
+
 fn row_at(pane: Rect, y: u16, len: usize) -> Option<usize> {
     if len == 0 {
         return None;
@@ -4911,6 +5108,27 @@ fn run_sync(
 mod tests {
     use super::*;
 
+<<<<<<< Updated upstream
+=======
+<<<<<<< Updated upstream
+=======
+    #[test]
+    fn calendar_click_maps_to_day() {
+        // Oct 2026 starts on a Thursday; a 30-wide pane centres the grid 4 in.
+        let cal = Rect::new(0, 0, 30, 9);
+        let oct = NaiveDate::from_ymd_opt(2026, 10, 13).unwrap();
+        let day = |x, y| calendar_day_at(cal, Position::new(x, y), oct);
+        let d = |n| NaiveDate::from_ymd_opt(2026, 10, n);
+        assert_eq!(day(14, 2), d(1), "first Thursday");
+        assert_eq!(day(15, 2), d(1), "either digit of the cell");
+        assert_eq!(day(16, 2), None, "the gap between cells");
+        assert_eq!(day(5, 2), None, "before the 1st");
+        assert_eq!(day(8, 4), d(13), "Tuesday, week 3");
+        assert_eq!(day(5, 1), None, "weekday header row");
+        assert_eq!(day(14, 7), None, "past the end of the month");
+    }
+
+>>>>>>> Stashed changes
     /// An app holding a single empty project — a base for the sorting tests.
     fn test_app() -> App {
         let mut store = Store::default();
@@ -4922,6 +5140,10 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
+<<<<<<< Updated upstream
+=======
+>>>>>>> Stashed changes
+>>>>>>> Stashed changes
     #[test]
     fn step_clamps_within_bounds() {
         assert_eq!(step(0, -1, 5), 0);

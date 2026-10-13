@@ -5,7 +5,7 @@ use chrono::NaiveDate;
 use rusqlite::{Connection, params};
 
 /// Bump when the schema changes and add a matching arm in `migrate`.
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 
 /// A raw `projects` row: (id, name, description, repo, tags, created).
 type ProjectRow = (i64, String, String, Option<String>, String, String);
@@ -93,6 +93,7 @@ impl SqliteStorage {
                 title TEXT NOT NULL,
                 date TEXT NOT NULL,
                 done INTEGER DEFAULT 0,
+                description TEXT NOT NULL DEFAULT '',
                 FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
             );
             CREATE TABLE IF NOT EXISTS meetings (
@@ -203,6 +204,25 @@ impl SqliteStorage {
                          );",
                     )
                     .map_err(|e| e.to_string())?,
+                // 8 -> 9: milestones gained a `description`. A milestones table
+                // first created by this build already has it.
+                8 => {
+                    let has_col: bool = self
+                        .conn
+                        .query_row(
+                            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('milestones') WHERE name = 'description')",
+                            [],
+                            |row| row.get::<_, i64>(0).map(|n| n != 0),
+                        )
+                        .map_err(|e| e.to_string())?;
+                    if !has_col {
+                        self.conn
+                            .execute_batch(
+                                "ALTER TABLE milestones ADD COLUMN description TEXT NOT NULL DEFAULT '';",
+                            )
+                            .map_err(|e| e.to_string())?;
+                    }
+                }
                 other => return Err(format!("no migration path from schema version {other}")),
             }
             version += 1;
@@ -365,7 +385,7 @@ impl SqliteStorage {
     fn load_milestones(&self, project_id: i64) -> Result<Vec<Milestone>, String> {
         let mut stmt = self
             .conn
-            .prepare("SELECT title, date, done FROM milestones WHERE project_id = ?1 ORDER BY id")
+            .prepare("SELECT title, date, done, description FROM milestones WHERE project_id = ?1 ORDER BY id")
             .map_err(|e| e.to_string())?;
         stmt.query_map(params![project_id], |row| {
             Ok(Milestone {
@@ -373,6 +393,7 @@ impl SqliteStorage {
                 date: chrono::NaiveDate::parse_from_str(&row.get::<_, String>(1)?, "%Y-%m-%d")
                     .unwrap_or_default(),
                 done: row.get::<_, i64>(2)? != 0,
+                description: row.get(3)?,
             })
         })
         .map_err(|e| e.to_string())?
@@ -513,12 +534,13 @@ impl SqliteStorage {
 
             for ms in &project.milestones {
                 tx.execute(
-                    "INSERT INTO milestones (project_id, title, date, done) VALUES (?1, ?2, ?3, ?4)",
+                    "INSERT INTO milestones (project_id, title, date, done, description) VALUES (?1, ?2, ?3, ?4, ?5)",
                     params![
                         pid,
                         ms.title,
                         ms.date.format("%Y-%m-%d").to_string(),
-                        ms.done as i64
+                        ms.done as i64,
+                        ms.description
                     ],
                 )
                 .map_err(|e| e.to_string())?;

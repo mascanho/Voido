@@ -249,11 +249,6 @@ impl Config {
     }
 }
 
-<<<<<<< Updated upstream
-=======
-<<<<<<< Updated upstream
-=======
->>>>>>> Stashed changes
 /// Leading comment block written to `config.toml` on every save.
 const SETTINGS_HEADER: &str = "\
 # voido settings (TOML). Every key is optional — delete a line for its default.
@@ -268,10 +263,7 @@ const SETTINGS_HEADER: &str = "\
 #   theme         Colour theme slug, e.g. \"dracula\". Unknown -> default.
 #   weather       Place name, \"lat,lon\", or \"auto\" (IP-based). Empty = off.
 #   weather_unit  \"c\" (default) or \"f\".
-<<<<<<< Updated upstream
-=======
 #   calendar_hidden  true collapses the calendar under Projects (`c` toggles).
->>>>>>> Stashed changes
 #
 # ^s fills in `storage` and `github_repo` for you. ^k -> \"Settings from GitHub\"
 # replaces this file with one kept in a repo (your `github_token` is never
@@ -295,10 +287,6 @@ const SETTINGS_HEADER: &str = "\
 #   bg     = \"#0a0a14\"
 ";
 
-<<<<<<< Updated upstream
-=======
->>>>>>> Stashed changes
->>>>>>> Stashed changes
 #[cfg(test)]
 mod tests {
     use super::*;

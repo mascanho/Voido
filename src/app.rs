@@ -252,6 +252,36 @@ pub enum EditTarget {
     SubtaskNote(usize),
     /// The agenda / minutes of the meeting at this index.
     MeetingNote(usize),
+    /// The description of the milestone at this index.
+    MilestoneNote(usize),
+}
+
+/// One thing scheduled on a calendar day, as listed in the day pane.
+pub struct DayItem {
+    pub kind: DayKind,
+    pub title: String,
+    /// Meeting start time, when one was given.
+    pub time: Option<String>,
+    pub done: bool,
+    /// Markdown: the todo's note, milestone's description or meeting agenda.
+    pub body: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DayKind {
+    Todo,
+    Milestone,
+    Meeting,
+}
+
+impl DayKind {
+    pub fn icon(self) -> &'static str {
+        match self {
+            DayKind::Todo => "○",
+            DayKind::Milestone => "◆",
+            DayKind::Meeting => "◷",
+        }
+    }
 }
 
 /// The note `^f` blows up to fill the window.
@@ -663,11 +693,6 @@ pub struct App {
     /// Scroll offset of the meeting agenda / minutes pane.
     pub meeting_note_scroll: u16,
     pub note_expanded: bool,
-<<<<<<< Updated upstream
-=======
-<<<<<<< Updated upstream
-=======
->>>>>>> Stashed changes
     /// `^f`: the note on screen fills the whole window, panes and all.
     pub note_full: bool,
     /// `n` toggles the selected todo's note into the detail pane; `n` inside the
@@ -678,13 +703,10 @@ pub struct App {
     /// While a subtask note is open, `l` steps focus into that pane so `j`/`k`
     /// scroll it; `h` / `esc` steps back out to the subtask list.
     pub sub_note_focus: bool,
-<<<<<<< Updated upstream
-=======
     /// Focus sits on the calendar under Projects (only while `focus` is
     /// `Projects`); `cal_sel` is its selected day, and picks the month shown.
     pub cal_focus: bool,
     pub cal_sel: NaiveDate,
->>>>>>> Stashed changes
     pub todo_note_scroll: u16,
     pub sub_note_scroll: u16,
     /// `i` toggles an inline detail panel (tags, dates, counts…) under the
@@ -707,10 +729,6 @@ pub struct App {
     last_activity_status: String,
     /// Transient corner notification, cleared by `tick_toast` once it's old.
     pub toast: Option<Toast>,
-<<<<<<< Updated upstream
-=======
->>>>>>> Stashed changes
->>>>>>> Stashed changes
     pub timeline_idx: usize,
     pub deadline_filter: DeadlineFilter,
     /// The ordering last applied to each list, indexed by `SortScope`. Kept so
@@ -808,26 +826,15 @@ impl App {
             subtask_idx: 0,
             note_idx: 0,
             note_scroll: 0,
-<<<<<<< Updated upstream
-=======
-<<<<<<< Updated upstream
-=======
->>>>>>> Stashed changes
             meeting_idx: 0,
             meeting_note_scroll: 0,
             todo_note_open: false,
             sub_note_open: false,
             sub_note_focus: false,
-<<<<<<< Updated upstream
-            todo_note_scroll: 0,
-            sub_note_scroll: 0,
-=======
             cal_focus: false,
             cal_sel: Local::now().date_naive(),
             todo_note_scroll: 0,
             sub_note_scroll: 0,
->>>>>>> Stashed changes
->>>>>>> Stashed changes
             note_expanded: false,
             note_full: false,
             project_info: false,
@@ -1949,11 +1956,6 @@ impl App {
 
         let g_pending = std::mem::replace(&mut self.pending_g, false);
 
-<<<<<<< Updated upstream
-=======
-<<<<<<< Updated upstream
-=======
->>>>>>> Stashed changes
         // A full-screen note swallows the navigation keys — there are no panes
         // to move between — but leaves the global ones below it alone.
         if self.note_full
@@ -1968,8 +1970,6 @@ impl App {
             return;
         }
 
-<<<<<<< Updated upstream
-=======
         if self.calendar_focused() && self.handle_calendar_key(key) {
             return;
         }
@@ -1979,8 +1979,6 @@ impl App {
                 KeyCode::Tab | KeyCode::BackTab | KeyCode::Char('1'..='5')
             );
 
->>>>>>> Stashed changes
->>>>>>> Stashed changes
         match key.code {
             KeyCode::Char('q') => {
                 self.mode = Mode::Confirm(ConfirmState {
@@ -2082,7 +2080,7 @@ impl App {
     }
 
     /// What the selected project has on the calendar's selected day.
-    pub fn cal_day_items(&self, date: NaiveDate) -> Vec<String> {
+    pub fn cal_day_items(&self, date: NaiveDate) -> Vec<DayItem> {
         let Some(p) = self.current_project() else {
             return Vec::new();
         };
@@ -2090,19 +2088,44 @@ impl App {
         let miles = p.milestones.iter().filter(|m| m.date == date);
         let meets = p.meetings.iter().filter(|m| m.date == date);
         todos
-            .map(|t| format!("○ {}", t.title))
-            .chain(miles.map(|m| format!("◆ {}", m.title)))
-            .chain(meets.map(|m| format!("◷ {}", m.title)))
+            .map(|t| DayItem {
+                kind: DayKind::Todo,
+                title: t.title.clone(),
+                time: None,
+                done: t.done,
+                body: t.note.clone(),
+            })
+            .chain(miles.map(|m| DayItem {
+                kind: DayKind::Milestone,
+                title: m.title.clone(),
+                time: None,
+                done: m.done,
+                body: m.description.clone(),
+            }))
+            .chain(meets.map(|m| DayItem {
+                kind: DayKind::Meeting,
+                title: m.title.clone(),
+                time: m.time.clone(),
+                done: m.held,
+                body: m.note.clone(),
+            }))
             .collect()
     }
 
+    /// The day whose items fill the right-hand pane: the calendar's selection,
+    /// while the calendar has focus and that day has something on it.
+    pub fn cal_day_open(&self) -> Option<NaiveDate> {
+        (self.calendar_focused() && !self.cal_day_items(self.cal_sel).is_empty())
+            .then_some(self.cal_sel)
+    }
+
     fn cal_status(&mut self) {
-        let items = self.cal_day_items(self.cal_sel);
+        let n = self.cal_day_items(self.cal_sel).len();
         let day = self.cal_sel.format("%a %-d %b");
-        self.status = if items.is_empty() {
-            format!("{day} — nothing scheduled")
-        } else {
-            format!("{day} — {}", items.join("  ·  "))
+        self.status = match n {
+            0 => format!("{day} — nothing scheduled"),
+            1 => format!("{day} — 1 item"),
+            n => format!("{day} — {n} items"),
         };
     }
 
@@ -2191,21 +2214,11 @@ impl App {
                     });
                 }
             }
-<<<<<<< Updated upstream
-=======
-<<<<<<< Updated upstream
-            KeyCode::Char('o') => self.show_github(),
-=======
->>>>>>> Stashed changes
             KeyCode::Char('o') => self.open_sort(SortScope::Projects),
             KeyCode::Char('R') => self.show_github(),
             KeyCode::Char('t') => self.open_tags(),
             KeyCode::Char('i') => self.project_info = !self.project_info,
-<<<<<<< Updated upstream
-=======
             KeyCode::Char('c') => self.toggle_calendar(),
->>>>>>> Stashed changes
->>>>>>> Stashed changes
             KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => {
                 if !self.store.projects.is_empty() {
                     self.focus = Focus::Content;
@@ -2807,6 +2820,26 @@ impl App {
         };
     }
 
+    /// Open the Markdown editor on the description of the selected Schedule
+    /// row: a milestone's own description, or a todo's note.
+    fn begin_edit_schedule_note(&mut self) {
+        let Some(entry) = self.current_deadline() else {
+            self.status = "nothing scheduled to describe".into();
+            return;
+        };
+        let p = self.current_project();
+        if let Some(mi) = entry.milestone_idx
+            && let Some(m) = p.and_then(|p| p.milestones.get(mi))
+        {
+            let desc = m.description.clone();
+            self.begin_edit(EditTarget::MilestoneNote(mi), &desc);
+            self.status = "editing milestone description — esc / ^s to save".into();
+        } else if let Some(ti) = entry.todo_idx {
+            self.todo_idx = ti;
+            self.begin_edit_todo_note();
+        }
+    }
+
     /// Open the Markdown editor on the selected meeting's agenda / minutes.
     fn begin_edit_meeting_note(&mut self) {
         let Some(m) = self.current_meeting() else {
@@ -2936,6 +2969,16 @@ impl App {
                     self.status = "meeting notes saved".into();
                 }
                 self.meeting_note_scroll = 0;
+            }
+            EditTarget::MilestoneNote(i) => {
+                if let Some(m) = self
+                    .current_project_mut()
+                    .and_then(|p| p.milestones.get_mut(i))
+                {
+                    m.description = body;
+                    self.dirty = true;
+                    self.status = "milestone description saved".into();
+                }
             }
             EditTarget::SubtaskNote(i) => {
                 let ti = self.todo_idx;
@@ -3672,6 +3715,7 @@ impl App {
             KeyCode::Char('j') | KeyCode::Down => self.move_sel(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_sel(-1),
             KeyCode::Char('h') | KeyCode::Left => self.focus = Focus::Projects,
+            KeyCode::Char('N') => self.begin_edit_schedule_note(),
             KeyCode::Char('f') => {
                 self.deadline_filter = self.deadline_filter.next();
                 self.timeline_idx = 0;
@@ -4020,6 +4064,7 @@ impl App {
                                 title,
                                 date,
                                 done: false,
+                                description: String::new(),
                             });
                         }
                         self.dirty = true;
@@ -5108,10 +5153,37 @@ fn run_sync(
 mod tests {
     use super::*;
 
-<<<<<<< Updated upstream
-=======
-<<<<<<< Updated upstream
-=======
+    #[test]
+    fn milestone_description_edits_and_lists_on_its_day() {
+        let mut app = test_app();
+        let day = NaiveDate::from_ymd_opt(2026, 10, 20).unwrap();
+        app.store.projects[0].milestones.push(Milestone {
+            title: "Launch".into(),
+            date: day,
+            done: false,
+            description: String::new(),
+        });
+
+        // `4` opens the Schedule, `N` edits the selected milestone's description.
+        app.handle_key(key(KeyCode::Char('4')));
+        app.handle_key(key(KeyCode::Char('N')));
+        assert!(matches!(
+            app.mode,
+            Mode::EditBody(ref e) if e.target == EditTarget::MilestoneNote(0)
+        ));
+        app.handle_key(key(KeyCode::Char('G')));
+        app.handle_key(key(KeyCode::Char('o')));
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.store.projects[0].milestones[0].description, "Go");
+
+        // The calendar's day list carries it, description and all.
+        let items = app.cal_day_items(day);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].kind, DayKind::Milestone);
+        assert_eq!(items[0].body, "Go");
+        assert!(app.cal_day_items(day.succ_opt().unwrap()).is_empty());
+    }
+
     #[test]
     fn calendar_click_maps_to_day() {
         // Oct 2026 starts on a Thursday; a 30-wide pane centres the grid 4 in.
@@ -5128,7 +5200,6 @@ mod tests {
         assert_eq!(day(14, 7), None, "past the end of the month");
     }
 
->>>>>>> Stashed changes
     /// An app holding a single empty project — a base for the sorting tests.
     fn test_app() -> App {
         let mut store = Store::default();
@@ -5140,10 +5211,6 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
-<<<<<<< Updated upstream
-=======
->>>>>>> Stashed changes
->>>>>>> Stashed changes
     #[test]
     fn step_clamps_within_bounds() {
         assert_eq!(step(0, -1, 5), 0);

@@ -53,20 +53,26 @@ pub fn render(f: &mut Frame, app: &App) {
         // `^f` — the note fills the window; no rails, no lists.
         rects.detail = body_rect;
         render_full_note(f, body_rect, app, title, body, scroll);
-    } else if app.tab == Tab::Todos || app.tab == Tab::Notes || app.tab == Tab::Meetings {
+    } else if let Some(day) = app.cal_day_open() {
+        // A calendar day with something on it: its items open on the right.
+        let body = Layout::horizontal([
+            Constraint::Percentage(30),
+            Constraint::Percentage(30),
+            Constraint::Percentage(40),
+        ])
+        .split(body_rect);
+        rects.content = body[1];
+        render_projects_rail(f, body[0], app, &mut rects);
+        render_content(f, body[1], app);
+        render_cal_day(f, body[2], app, day);
+    } else if matches!(
+        app.tab,
+        Tab::Todos | Tab::Notes | Tab::Meetings | Tab::Schedule
+    ) {
         if app.tab == Tab::Notes && app.note_expanded && app.focus == Focus::Detail {
             // Full-width note mode — projects + note body (or its editor) only.
             let body = Layout::horizontal([Constraint::Percentage(30), Constraint::Percentage(70)])
-<<<<<<< Updated upstream
                 .split(body_rect);
-=======
-<<<<<<< Updated upstream
-                .split(rows[1]);
->>>>>>> Stashed changes
-            rects.projects = body[0];
-=======
-                .split(body_rect);
->>>>>>> Stashed changes
             rects.detail = body[1];
             render_projects_rail(f, body[0], app, &mut rects);
             if let Mode::EditBody(state) = &app.mode {
@@ -80,16 +86,7 @@ pub fn render(f: &mut Frame, app: &App) {
                 Constraint::Percentage(30),
                 Constraint::Percentage(40),
             ])
-<<<<<<< Updated upstream
             .split(body_rect);
-=======
-<<<<<<< Updated upstream
-            .split(rows[1]);
->>>>>>> Stashed changes
-            rects.projects = body[0];
-=======
-            .split(body_rect);
->>>>>>> Stashed changes
             rects.content = body[1];
             rects.detail = body[2];
             render_projects_rail(f, body[0], app, &mut rects);
@@ -111,21 +108,13 @@ pub fn render(f: &mut Frame, app: &App) {
                 }
                 (_, Tab::Todos) => render_subtasks(f, body[2], app),
                 (_, Tab::Meetings) => render_meeting_note(f, body[2], app),
+                (_, Tab::Schedule) => render_schedule_detail(f, body[2], app),
                 _ => render_note_body(f, body[2], app),
             }
         }
     } else {
         let body = Layout::horizontal([Constraint::Percentage(30), Constraint::Percentage(70)])
-<<<<<<< Updated upstream
             .split(body_rect);
-=======
-<<<<<<< Updated upstream
-            .split(rows[1]);
->>>>>>> Stashed changes
-        rects.projects = body[0];
-=======
-            .split(body_rect);
->>>>>>> Stashed changes
         rects.content = body[1];
         render_projects_rail(f, body[0], app, &mut rects);
         render_content(f, body[1], app);
@@ -1324,6 +1313,126 @@ fn render_meetings(f: &mut Frame, area: Rect, app: &App) {
 }
 
 /// The third pane on the Meetings tab: the selected meeting's agenda / minutes.
+/// Right of the Schedule: the selected row's description — a milestone's own,
+/// or the todo's note.
+fn render_schedule_detail(f: &mut Frame, area: Rect, app: &App) {
+    let Some(e) = app.current_deadline() else {
+        let block = panel(" Description ".to_string(), false);
+        f.render_widget(
+            hint("Pick a scheduled item to see its description.").block(block),
+            area,
+        );
+        return;
+    };
+    let p = app.current_project();
+    let body = match (e.milestone_idx, e.todo_idx) {
+        (Some(mi), _) => p
+            .and_then(|p| p.milestones.get(mi))
+            .map(|m| m.description.as_str()),
+        (_, Some(ti)) => p.and_then(|p| p.todos.get(ti)).map(|t| t.note.as_str()),
+        _ => None,
+    }
+    .unwrap_or("");
+
+    let icon = if e.kind == TlKind::Milestone {
+        "◆"
+    } else {
+        "○"
+    };
+    let block = panel(
+        fit_title(
+            format!(" {icon} {} · {} ", e.label, e.date.format("%b %d")),
+            area.width,
+        ),
+        false,
+    )
+    .padding(Padding::horizontal(1));
+
+    if body.trim().is_empty() {
+        f.render_widget(
+            hint("No description yet.  Press N to write one in Markdown.").block(block),
+            area,
+        );
+        return;
+    }
+    let rendered = app.note_body_lines(body, area.width.saturating_sub(4));
+    f.render_widget(
+        Paragraph::new(rendered)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+/// The calendar's selected day, opened on the right: everything the project
+/// has on it, each with its description underneath.
+fn render_cal_day(f: &mut Frame, area: Rect, app: &App, day: NaiveDate) {
+    let items = app.cal_day_items(day);
+    let today = Local::now().date_naive();
+    let label = if day == today {
+        "today".to_string()
+    } else {
+        rel(day, today)
+    };
+    let block = panel(
+        fit_title(format!(" Due on: {} ", day.format("%A %-d %B")), area.width),
+        true,
+    )
+    .title_bottom(Line::from(Span::styled(
+        format!(" {label} · {} ", items.len()),
+        Style::new().fg(subtle()),
+    )))
+    .padding(Padding::horizontal(1));
+
+    let width = area.width.saturating_sub(4);
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, it) in items.iter().enumerate() {
+        if i > 0 {
+            lines.push(Line::from(Span::styled(
+                "─".repeat(width as usize),
+                Style::new().fg(border()),
+            )));
+        }
+        let overdue = !it.done && day < today && it.kind != crate::app::DayKind::Meeting;
+        let icon_style = if it.done {
+            Style::new().fg(green())
+        } else if overdue {
+            Style::new().fg(red())
+        } else {
+            Style::new().fg(accent())
+        };
+        let title_style = if it.done {
+            Style::new()
+                .fg(subtle())
+                .add_modifier(Modifier::CROSSED_OUT)
+        } else {
+            Style::new().fg(text()).bold()
+        };
+        let mut head = vec![
+            Span::styled(format!("{} ", it.kind.icon()), icon_style),
+            Span::styled(it.title.clone(), title_style),
+        ];
+        if let Some(t) = &it.time {
+            head.push(Span::styled(format!("  {t}"), Style::new().fg(blue())));
+        }
+        lines.push(Line::from(head));
+        if it.body.trim().is_empty() {
+            lines.push(Line::from(Span::styled(
+                "  no description",
+                Style::new().fg(subtle()).italic(),
+            )));
+        } else {
+            lines.extend(crate::md::render(&it.body, width));
+        }
+    }
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
 fn render_meeting_note(f: &mut Frame, area: Rect, app: &App) {
     let focused = app.focus == Focus::Detail;
 
@@ -1462,6 +1571,11 @@ fn render_edit_body_pane(f: &mut Frame, area: Rect, state: &crate::app::EditStat
             .current_meeting()
             .map(|m| format!("meeting · {}", m.title))
             .unwrap_or_else(|| "meeting notes".into()),
+        EditTarget::MilestoneNote(i) => app
+            .current_project()
+            .and_then(|p| p.milestones.get(i))
+            .map(|m| format!("milestone · {}", m.title))
+            .unwrap_or_else(|| "milestone description".into()),
     };
 
     let split = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).split(area);
@@ -1677,15 +1791,8 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
         | Mode::Sort(_) => ("N", accent()),
     };
     let pane_label = match app.focus {
-<<<<<<< Updated upstream
-        _ if app.note_full => "NOTE·FULL",
-=======
-<<<<<<< Updated upstream
-=======
         _ if app.note_full => "NOTE·FULL",
         Focus::Projects if app.calendar_focused() => "CALENDAR",
->>>>>>> Stashed changes
->>>>>>> Stashed changes
         Focus::Projects => "PROJECTS",
         Focus::Content => match app.tab {
             Tab::Overview => "OVERVIEW",
@@ -2090,29 +2197,18 @@ fn render_help(f: &mut Frame, area: Rect) {
     ];
     const COL2: &[Row] = &[
         ("", "PROJECTS"),
-<<<<<<< Updated upstream
-=======
-<<<<<<< Updated upstream
-        ("a  r  d", "add / rename / del"),
-        ("l", "open project"),
-        ("o", "show repo activity"),
-=======
->>>>>>> Stashed changes
         ("a r d", "add · rename · delete"),
         ("l", "open"),
         ("i", "detail panel"),
         ("t", "tags"),
         ("o  R", "sort · repo view"),
-<<<<<<< Updated upstream
-=======
         ("c", "show / hide calendar"),
         ("", ""),
         ("", "CALENDAR  (j past last project)"),
         ("hjkl ←↓↑→", "move day · week"),
         ("[ ]  t", "month · today"),
         ("enter  esc", "open in schedule · back"),
->>>>>>> Stashed changes
->>>>>>> Stashed changes
+        ("", "  a day's items open on the right"),
         ("", ""),
         ("", "OVERVIEW"),
         ("e  r", "description · rename"),
@@ -2123,7 +2219,7 @@ fn render_help(f: &mut Frame, area: Rect) {
         ("e  d", "edit · delete"),
         ("x  r", "done · reschedule"),
         ("f", "cycle filter"),
-        ("l", "jump to todo"),
+        ("l  N", "jump to todo · edit description"),
         ("", ""),
         ("", "MEETINGS"),
         ("a e d", "add · edit · del"),

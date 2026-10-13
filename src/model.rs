@@ -226,6 +226,9 @@ pub struct Milestone {
     pub date: NaiveDate,
     #[serde(default)]
     pub done: bool,
+    /// Markdown description, shown beside the Schedule and the calendar.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
 }
 
 /// A meeting on a project: when it is (or was), who's in it, and the Markdown
@@ -469,11 +472,13 @@ _Fill these in as we go._
                 title: "Design review".into(),
                 date: day(5),
                 done: false,
+                description: String::new(),
             },
             Milestone {
                 title: "Public launch".into(),
                 date: day(21),
                 done: false,
+                description: String::new(),
             },
         ];
 
@@ -497,6 +502,7 @@ _Fill these in as we go._
             title: "v0.1 release".into(),
             date: day(7),
             done: false,
+            description: String::new(),
         }];
 
         Store {
@@ -595,6 +601,7 @@ mod tests {
             title: "m".into(),
             date: NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
             done: true,
+            description: String::new(),
         }];
 
         assert!(!p.is_complete(), "t1 not done, s2 not done");
